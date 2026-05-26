@@ -1,0 +1,6 @@
+node_modules/
+
+# Chromium binary cache — downloaded on first --ui run (~300 MB).
+# Each developer's machine downloads its own platform-correct build.
+# The pinned build ID is in package.json under taskPrimer.browser.buildId.
+.browsers/

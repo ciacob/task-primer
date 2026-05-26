@@ -1,0 +1,41 @@
+{
+  "name": "task-primer",
+  "version": "0.1.0",
+  "description": "A resident work-delegation application: worker sub-process controlled via CLI flags, REST API, and browser UI.",
+  "main": "main.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start":      "node main.js",
+    "start:ui":   "node main.js --ui",
+    "start:dev":  "node main.js --ui --worker-crash=restart --autoexit"
+  },
+  "taskPrimer": {
+    "browser": {
+      "product":   "chrome",
+      "buildId":   "1274542",
+      "milestone": 124,
+      "cacheDir":  ".browsers",
+      "notes": [
+        "Chrome for Testing — pinned, never auto-updates.",
+        "Provides a frameless --app window whose process is a direct child",
+        "of main.js, enabling reliable exit detection via ChildProcess events.",
+        "To update: change buildId to a new build from",
+        "https://googlechromelabs.github.io/chrome-for-testing/",
+        "then delete .browsers/ so the new build is downloaded on next --ui run."
+      ]
+    }
+  },
+  "keywords": ["worker", "subprocess", "ipc", "fastify", "task-queue"],
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/static":    "^9.0.0",
+    "@fastify/websocket": "^11.2.0",
+    "@puppeteer/browsers": "^2.0.0",
+    "fastify":            "^5.8.4",
+    "fastify-plugin":     "^5.1.0",
+    "ws":                 "^8.20.0",
+    "yargs":              "^18.0.0"
+  }
+}
