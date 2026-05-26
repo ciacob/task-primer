@@ -71,11 +71,16 @@
     // ─── REST helpers ─────────────────────────────────────────────────────────
 
     async _post(path, body) {
+      const hasBody = body !== undefined && body !== null;
       const res = await fetch(`${BASE_URL}${path}`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    body ? JSON.stringify(body) : undefined,
+        headers: hasBody ? { 'Content-Type': 'application/json' } : {},
+        body:    hasBody ? JSON.stringify(body) : undefined,
       });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
       return res.json();
     }
 

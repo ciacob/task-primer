@@ -87,6 +87,7 @@ function buildLaunchArgs(url) {
     '--no-default-browser-check',
     '--disable-extensions',
     '--disable-translate',
+    '--disable-infobars'
   ];
 
   if (process.platform === 'linux') {

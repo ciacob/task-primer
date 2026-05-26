@@ -71,30 +71,35 @@
   }
 
   // ─── Button handlers ───────────────────────────────────────────────────────
-  btnStart.addEventListener('click', async () => {
-    logEntry('Assigning example task…');
-    await adapter.assign('worker/example-task.js', { steps: 50 });
-  });
+  async function cmd(label, fn, kind) {
+    logEntry(label, kind);
+    try {
+      await fn();
+    } catch (err) {
+      logEntry('Error: ' + err.message, 'error');
+      console.error(err);
+    }
+  }
 
-  btnPause.addEventListener('click', async () => {
-    logEntry('Pausing…');
-    await adapter.pause();
-  });
+  btnStart.addEventListener('click', () =>
+    cmd('Assigning example task…', () => adapter.assign('worker/example-task.js', { steps: 50 }))
+  );
 
-  btnResume.addEventListener('click', async () => {
-    logEntry('Resuming…');
-    await adapter.resume();
-  });
+  btnPause.addEventListener('click', () =>
+    cmd('Pausing…', () => adapter.pause())
+  );
 
-  btnAbort.addEventListener('click', async () => {
-    logEntry('Aborting…', 'error');
-    await adapter.abort();
-  });
+  btnResume.addEventListener('click', () =>
+    cmd('Resuming…', () => adapter.resume())
+  );
 
-  btnReset.addEventListener('click', async () => {
-    logEntry('Resetting to idle…');
-    await adapter.reset();
-  });
+  btnAbort.addEventListener('click', () =>
+    cmd('Aborting…', () => adapter.abort(), 'error')
+  );
+
+  btnReset.addEventListener('click', () =>
+    cmd('Resetting to idle…', () => adapter.reset())
+  );
 
   // ─── Wire up adapter ───────────────────────────────────────────────────────
   adapter.onStateChange((state) => {
