@@ -19,8 +19,8 @@ modular foundation onto which real applications can be layered.
 │   │  ┌─────▼──────┐  │                    │ WebSocket        │
 │   │  │ task module│  │                    ▼                  │
 │   │  │ (any CJS   │  │     ┌──────────────────────────────┐  │
-│   │  │  module)   │  │     │  Chromium --app window       │  │
-│   │  └────────────┘  │     │  (pinned build, our process) │  │
+│   │  │  module)   │  │     │  Chrome for Testing --app    │  │
+│   │  └────────────┘  │     │  (our process, direct child) │  │
 │   └──────────────────┘     │  adapter.js + app.js         │  │
 │                            └──────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
@@ -34,7 +34,7 @@ modular foundation onto which real applications can be layered.
 npm install
 
 node main.js                           # headless, port 3000
-node main.js --ui                      # download Chromium (once), open app window
+node main.js --ui                      # download Chrome (once), open app window
 node main.js --ui --autoexit           # also exit when the window is closed
 node main.js --ui --port 8080          # custom port
 node main.js --worker-crash=restart    # auto-restart worker on crash
@@ -56,8 +56,8 @@ npm run start:dev     # browser + autoexit + auto-restart worker
 |------|---------|-------------|
 | `--port` | `3000` | Web server port |
 | `--host` | `127.0.0.1` | Web server bind address |
-| `--ui` | `false` | Download (once) and launch the pinned Chromium build as an app window |
-| `--autoexit` | `false` | Exit the application when the Chromium window is closed. Requires `--ui` |
+| `--ui` | `false` | Download (once) and launch Chrome for Testing as an app window |
+| `--autoexit` | `false` | Exit the application when the browser window is closed. Requires `--ui` |
 | `--worker-crash` | `report` | `report` or `restart` — what to do if the worker process dies unexpectedly |
 
 ---
@@ -65,9 +65,9 @@ npm run start:dev     # browser + autoexit + auto-restart worker
 ## Browser window (`--ui`)
 
 The `--ui` flag does not open the user's default browser. Instead it downloads
-a **pinned Chrome for Testing** build into `.browsers/` and launches it as a
-dedicated app window (`--app` mode — no address bar, no tabs). This has several
-deliberate consequences:
+**Chrome for Testing** into `.browsers/` and launches it as a dedicated app
+window (`--app` mode — no address bar, no tabs). This has several deliberate
+consequences:
 
 - **The browser process is a direct child of `main.js`.** Its exit is detectable
   via a normal Node.js `ChildProcess` `exit` event — no WebSocket heuristics
@@ -78,39 +78,59 @@ deliberate consequences:
 
 ### First run
 
-The first `--ui` invocation downloads Chromium (~300 MB) and caches it locally:
+On first `--ui` invocation the launcher resolves the current stable Chrome for
+Testing release and downloads it (~300 MB, one time):
 
 ```
-[browser] Chromium 124 (build 1274542) not found in cache.
-[browser] Downloading for platform: linux
+[browser] Chrome for Testing 124.0.6367.207 not found in cache.
+[browser] Platform: mac-arm64
+[browser] Cache directory: /your/project/.browsers
 [browser] This is a one-time download (~300 MB). Please wait…
 [browser] Downloading… 5%  …  100%
 [browser] Download complete.
-[browser] Launching Chromium → http://127.0.0.1:3000
+[browser] Launching Chrome for Testing → http://127.0.0.1:3000
 ```
 
 Subsequent runs skip straight to the launch line. The cache lives in `.browsers/`
 (git-ignored) in the project root.
 
-### Updating the pinned build
+### Build configuration
 
-The pinned build ID is stored in `package.json` under `taskPrimer.browser`:
+The browser build is configured in `package.json` under `taskPrimer.browser`:
 
 ```json
 "taskPrimer": {
   "browser": {
-    "product":   "chrome",
-    "buildId":   "1274542",
-    "milestone": 124,
-    "cacheDir":  ".browsers"
+    "product":  "chrome",
+    "buildId":  "stable",
+    "cacheDir": ".browsers"
   }
 }
 ```
 
-To update: find the new build ID at
-https://googlechromelabs.github.io/chrome-for-testing/, update `buildId` (and
-`milestone` for documentation), then delete `.browsers/` so the new build is
-downloaded on the next `--ui` run.
+**`buildId: "stable"` is a channel name, not a revision number.** At download
+time, `@puppeteer/browsers` resolves it to the latest Chrome for Testing stable
+release that has confirmed downloads for all platforms (`linux64`, `mac-arm64`,
+`mac-x64`, `win32`, `win64`). The resolved binary is then cached and reused —
+the network is only hit once.
+
+This approach is deliberately chosen over hardcoding a revision number because
+revision availability varies by platform: a revision that exists for `linux64`
+may simply 404 on `mac-arm64`. The stable channel endpoint is the only
+authoritative source of a version confirmed to be cross-platform.
+
+### Pinning to a specific version
+
+If reproducibility matters more than staying current, replace `"stable"` with
+an exact version string:
+
+```json
+"buildId": "124.0.6367.207"
+```
+
+Use only versions listed at https://googlechromelabs.github.io/chrome-for-testing/
+and verify the version shows HTTP 200 for your target platforms before committing.
+After changing the version, delete `.browsers/` to force a fresh download.
 
 ---
 
@@ -218,7 +238,7 @@ Every boundary is an explicit, replaceable interface:
 | WebSocket feed | `server/ws/status-feed.js` | Swap for SSE, socket.io, etc. |
 | UI transport | `ui/adapter.js` | Change API shape without touching UI |
 | UI rendering | `ui/app.js` + `ui/index.html` | Drop in React, Vue, Svelte, etc. |
-| Browser launcher | `browser/launcher.js` | Swap Chromium build, flags, or launch strategy |
+| Browser launcher | `browser/launcher.js` | Swap build, channel, or launch strategy |
 
 ---
 
@@ -227,7 +247,7 @@ Every boundary is an explicit, replaceable interface:
 ```
 task-primer/
 ├── main.js                    # Entry point — orchestrates all child processes
-├── package.json               # taskPrimer.browser block holds the pinned build config
+├── package.json               # taskPrimer.browser holds the browser build config
 ├── .gitignore                 # Excludes node_modules/ and .browsers/
 ├── shared/
 │   └── messages.js            # IPC message type constants and envelope factory
@@ -242,7 +262,7 @@ task-primer/
 │   └── ws/
 │       └── status-feed.js     # WebSocket broadcast plugin
 ├── browser/
-│   └── launcher.js            # Chromium download, cache, and spawn
+│   └── launcher.js            # Chrome for Testing: resolve, download, cache, spawn
 └── ui/
     ├── index.html             # Minimal control UI
     ├── adapter.js             # UIAdapter — all comms facade
@@ -253,20 +273,19 @@ task-primer/
 
 ## pkg compatibility
 
-The project uses only CJS (`require`/`module.exports`) throughout. Two areas
+The project uses only CJS (`require`/`module.exports`) throughout. Three areas
 require attention when bundling with `pkg`:
 
 **Task modules** — loaded via a runtime-computed `require(modulePath)` in
-`task-shell.js`. pkg cannot trace these statically; they must either be shipped
-as external files alongside the binary or loaded from a known asset path
-configured at build time.
+`task-shell.js`. pkg cannot trace these statically; ship them as external files
+alongside the binary or load from a known asset path configured at build time.
 
-**Chromium binary** — lives in `.browsers/` on disk, entirely outside any
-bundle. When packaging, set `taskPrimer.browser.cacheDir` to a path relative
-to `process.execPath` so the cache sits next to the distributed binary:
+**Chrome for Testing binary** — lives in `.browsers/` on disk, entirely outside
+any bundle. When packaging, point `cacheDir` to a path relative to the
+executable so the cache sits next to the distributed binary:
 
 ```js
-// In main.js, replace the cacheDir resolution with:
+// Suggested override in main.js when running under pkg:
 const cacheDir = path.resolve(path.dirname(process.execPath), '.browsers');
 ```
 
