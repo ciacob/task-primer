@@ -12,6 +12,7 @@
     "start:dev":  "node main.js --ui --worker-crash=restart --autoexit"
   },
   "taskPrimer": {
+    "appName": "Task Primer",
     "browser": {
       "product":  "chrome",
       "buildId":  "stable",

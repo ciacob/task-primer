@@ -219,18 +219,19 @@ function spawnServer() {
 // ─── Browser launch (--ui) ────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  const { launch, BROWSER_CONFIG } = require('./browser/launcher');
+  const { launch } = require('./browser/launcher');
 
-  // Resolve cache directory relative to the project root so it works
-  // both in development and when packaged with pkg (see README).
-  const pkgConfig = require('./package.json').taskPrimer?.browser || {};
-  const cacheDir  = path.resolve(
-    __dirname,
-    pkgConfig.cacheDir || '.browsers'
-  );
+  // Read config from package.json (taskPrimer.*) so all browser options
+  // are configurable without touching code. cacheDir is resolved relative
+  // to the project root; see README for the pkg packaging note.
+  const taskPrimerCfg = require('./package.json').taskPrimer || {};
+  const browserCfg    = taskPrimerCfg.browser || {};
+  const cacheDir      = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
+  const buildId       = browserCfg.buildId || 'stable';
+  const appName       = taskPrimerCfg.appName || null;
 
   try {
-    browserProc = await launch({ url: SERVER_URL, cacheDir });
+    browserProc = await launch({ url: SERVER_URL, cacheDir, buildId, appName });
 
     log('browser', `launched (pid=${browserProc.pid})`);
 

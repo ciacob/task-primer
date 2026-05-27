@@ -94,12 +94,13 @@ Testing release and downloads it (~300 MB, one time):
 Subsequent runs skip straight to the launch line. The cache lives in `.browsers/`
 (git-ignored) in the project root.
 
-### Build configuration
+### Browser configuration
 
-The browser build is configured in `package.json` under `taskPrimer.browser`:
+All browser-related settings live in `package.json` under `taskPrimer`:
 
 ```json
 "taskPrimer": {
+  "appName": "Task Primer",
   "browser": {
     "product":  "chrome",
     "buildId":  "stable",
@@ -108,16 +109,28 @@ The browser build is configured in `package.json` under `taskPrimer.browser`:
 }
 ```
 
-**`buildId: "stable"` is a channel name, not a revision number.** At download
+**`appName`** — the name shown in the macOS Dock, menu bar (the bold app name
+at the far left), and Mission Control. On first launch after download, the
+launcher patches `CFBundleName` and `CFBundleDisplayName` in the `.app` bundle's
+`Info.plist` using macOS's built-in `plutil` tool. A sentinel file next to the
+plist records the last-applied name so the patch runs only once — or again if
+the name is changed in `package.json`. Has no effect on Linux or Windows.
+Set to `null` or omit to skip renaming entirely.
+
+> **Note:** the macOS menu bar *entries* (File, Edit, View, …) are controlled
+> by Chrome's internals and cannot be customised via plist or flags. Only the
+> app name — the bold item at the far left of the menu bar — is affected.
+
+**`buildId: "stable"`** is a channel name, not a revision number. At download
 time, `@puppeteer/browsers` resolves it to the latest Chrome for Testing stable
 release that has confirmed downloads for all platforms (`linux64`, `mac-arm64`,
 `mac-x64`, `win32`, `win64`). The resolved binary is then cached and reused —
 the network is only hit once.
 
-This approach is deliberately chosen over hardcoding a revision number because
-revision availability varies by platform: a revision that exists for `linux64`
-may simply 404 on `mac-arm64`. The stable channel endpoint is the only
-authoritative source of a version confirmed to be cross-platform.
+This is deliberately chosen over hardcoding a revision number because revision
+availability varies by platform: a revision that exists for `linux64` may
+simply 404 on `mac-arm64`. The stable channel endpoint is the only authoritative
+source of a version confirmed to be cross-platform.
 
 ### Pinning to a specific version
 
