@@ -430,73 +430,163 @@ async function attachCDP(childProc, debugPort) {
     return;
   }
 
-  const ws = new WebSocket(wsUrl);
-  let msgId = 1;
+  // ── Browser-level WebSocket (target management + lifecycle events) ───────────
 
-  ws.on('open', () => {
-    // Enable Target domain events — gives us targetCreated and targetDestroyed
-    ws.send(JSON.stringify({
-      id:     msgId++,
+  const browserWs         = new WebSocket(wsUrl);
+  let   browserMsgId      = 1;
+  const browserPendingCmds = new Map();
+
+  // Promised CDP command on the browser endpoint
+  function browserSend(method, params) {
+    return new Promise((resolve) => {
+      const id = browserMsgId++;
+      browserPendingCmds.set(id, resolve);
+      browserWs.send(JSON.stringify({ id, method, params: params || {} }));
+    });
+  }
+
+  // ── Per-page CDP connection ───────────────────────────────────────────────
+  //
+  // Rather than multiplexing page-level commands through the browser session
+  // (which requires careful sessionId / id namespace management), we connect
+  // a dedicated WebSocket directly to each page target's own debugger URL.
+  // Chrome exposes these at GET http://127.0.0.1:<port>/json/list.
+  // This gives a clean, isolated channel where every command is properly
+  // sequenced and responses are unambiguous.
+
+  function getPageTargetWsUrl(debugPort, targetId) {
+    return new Promise((resolve, reject) => {
+      http.get(`http://127.0.0.1:${debugPort}/json/list`, (res) => {
+        let body = '';
+        res.on('data', c => { body += c; });
+        res.on('end', () => {
+          try {
+            const targets = JSON.parse(body);
+            const target  = targets.find(t => t.id === targetId);
+            if (target && target.webSocketDebuggerUrl) {
+              resolve(target.webSocketDebuggerUrl);
+            } else {
+              reject(new Error(`No WS URL for target ${targetId}`));
+            }
+          } catch (e) { reject(e); }
+        });
+      }).on('error', reject);
+    });
+  }
+
+  // Attach a dedicated WebSocket to a page target, inject the guard, reload.
+  const guardedTargets = new Set();
+
+  async function installGuard(targetId) {
+    if (guardedTargets.has(targetId)) return;
+    guardedTargets.add(targetId);
+
+    console.log('[browser] CDP: connecting to page target', targetId);
+
+    let pageWsUrl;
+    try {
+      pageWsUrl = await getPageTargetWsUrl(debugPort, targetId);
+    } catch (err) {
+      console.warn(`[browser] CDP: could not get page WS URL (non-fatal): ${err.message}`);
+      return;
+    }
+
+    const pageWs         = new WebSocket(pageWsUrl);
+    let   pageMsgId      = 1;
+    const pagePendingCmds = new Map();
+
+    function pageSend(method, params) {
+      return new Promise((resolve) => {
+        const id = pageMsgId++;
+        pagePendingCmds.set(id, resolve);
+        pageWs.send(JSON.stringify({ id, method, params: params || {} }));
+      });
+    }
+
+    pageWs.on('message', (data) => {
+      let msg;
+      try { msg = JSON.parse(data); } catch (_) { return; }
+      if (msg.id !== undefined && pagePendingCmds.has(msg.id)) {
+        const resolve = pagePendingCmds.get(msg.id);
+        pagePendingCmds.delete(msg.id);
+        resolve(msg.result || {});
+      }
+    });
+
+    await new Promise((resolve, reject) => {
+      pageWs.on('open', resolve);
+      pageWs.on('error', reject);
+    });
+
+    // Sequence matters: enable Page domain first, then register the script,
+    // then reload — each step awaited so ordering is guaranteed.
+    await pageSend('Page.enable', {});
+    await pageSend('Page.addScriptToEvaluateOnNewDocument', {
+      source: NAVIGATION_GUARD_SCRIPT,
+    });
+    await pageSend('Page.reload', { ignoreCache: false });
+
+    console.log('[browser] CDP: navigation guard injected, page reloading');
+
+    // Page WS can be closed after setup — the guard persists in the target
+    pageWs.close();
+  }
+
+  // ── Browser-level message dispatch ────────────────────────────────────────
+
+  const seenTargets = new Set();
+
+  browserWs.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch (_) { return; }
+
+    // Resolve browser-level request/response pairs
+    if (msg.id !== undefined && browserPendingCmds.has(msg.id)) {
+      const resolve = browserPendingCmds.get(msg.id);
+      browserPendingCmds.delete(msg.id);
+      resolve(msg.result || {});
+      return;
+    }
+
+    // setDiscoverTargets causes Chrome to emit targetCreated for all existing
+    // targets immediately — so this handles both existing and future pages.
+    if (msg.method === 'Target.targetCreated') {
+      const { targetId, type } = msg.params.targetInfo;
+      if (type === 'page' && !seenTargets.has(targetId)) {
+        seenTargets.add(targetId);
+        installGuard(targetId).catch(err => {
+          console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
+        });
+      }
+      return;
+    }
+
+    if (msg.method === 'Target.targetDestroyed') {
+      console.log('[browser] CDP: app window closed.');
+      childProc.emit('windowClosed');
+      browserWs.close();
+    }
+  });
+
+  // ── Startup ───────────────────────────────────────────────────────────────
+
+  browserWs.on('open', () => {
+    // setDiscoverTargets immediately fires targetCreated for all existing targets
+    // AND keeps firing it for any future ones — one call covers both cases.
+    browserWs.send(JSON.stringify({
+      id:     browserMsgId++,
       method: 'Target.setDiscoverTargets',
       params: { discover: true },
     }));
   });
 
-  // Helper: send a CDP command to a specific session (attached target)
-  function sessionSend(sessionId, method, params) {
-    ws.send(JSON.stringify({ id: msgId++, sessionId, method, params: params || {} }));
-  }
+  // ── Error / close handlers ────────────────────────────────────────────────
 
-  ws.on('message', (data) => {
-    let msg;
-    try { msg = JSON.parse(data); } catch (_) { return; }
-
-    // targetCreated fires when Chrome opens a new page/frame target.
-    // We attach to it and inject the navigation guard before any page code runs.
-    if (msg.method === 'Target.targetCreated') {
-      const { targetId, type } = msg.params.targetInfo;
-      if (type !== 'page') return; // Only care about page targets
-
-      // Attach to the target to get a sessionId for page-level commands
-      ws.send(JSON.stringify({
-        id:     msgId++,
-        method: 'Target.attachToTarget',
-        params: { targetId, flatten: true },
-      }));
-    }
-
-    // attachedToTarget gives us the sessionId we need for page-level commands
-    if (msg.method === 'Target.attachedToTarget') {
-      const { sessionId } = msg.params;
-
-      // Inject the navigation guard — runs before any page script on every
-      // document load, including navigations within the same target
-      sessionSend(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
-        source: NAVIGATION_GUARD_SCRIPT,
-      });
-
-      // Also enable Page events so we can log guard activity if needed
-      sessionSend(sessionId, 'Page.enable', {});
-    }
-
-    // targetDestroyed fires when any target (page, worker, etc.) is closed.
-    // In --app mode there is exactly one page target — the app window itself.
-    if (msg.method === 'Target.targetDestroyed') {
-      console.log('[browser] CDP: app window closed.');
-      childProc.emit('windowClosed');
-      ws.close();
-    }
-  });
-
-  ws.on('error', (err) => {
-    // Non-fatal: CDP is a best-effort enhancement
+  browserWs.on('error', (err) => {
     console.warn(`[browser] CDP WebSocket error (non-fatal): ${err.message}`);
   });
 
-  ws.on('close', () => {
-    // If the WebSocket closes without us explicitly closing it (e.g. Chrome
-    // crashed or was killed), treat it as a window-closed signal too so
-    // --autoexit still works in those cases.
+  browserWs.on('close', () => {
     if (childProc && !childProc.killed) {
       childProc.emit('windowClosed');
     }
@@ -510,10 +600,10 @@ async function attachCDP(childProc, debugPort) {
  * attach the CDP window-close detector.
  *
  * @param {object} options
- * @param {string} options.url         URL to open in the app window.
- * @param {string} options.cacheDir    Absolute path to the browser cache dir.
- * @param {string} options.buildId     Channel name or exact version (default: 'stable').
- * @param {string} [options.appName]   Desired macOS app name. Null to skip.
+ * @param {string} options.url        URL to open in the app window.
+ * @param {string} options.cacheDir   Absolute path to the browser cache dir.
+ * @param {string} options.buildId    Channel name or exact version (default: 'stable').
+ * @param {string} [options.appName]  Desired macOS app name. Null to skip.
  * @param {number} [options.debugPort] CDP remote debugging port (default: 9222).
  *
  * @returns {Promise<import('child_process').ChildProcess>}
