@@ -420,7 +420,7 @@ function waitForCDP(port, retries = 20, delayMs = 200) {
  * @param {import('child_process').ChildProcess} childProc
  * @param {number} debugPort
  */
-async function attachCDP(childProc, debugPort) {
+async function attachCDP(childProc, debugPort, appUrl) {
   let wsUrl;
   try {
     wsUrl = await waitForCDP(debugPort);
@@ -536,6 +536,11 @@ async function attachCDP(childProc, debugPort) {
 
   const seenTargets = new Set();
 
+  // The targetId of the page that loaded our app URL. We only emit
+  // 'windowClosed' when THIS target is destroyed, not DevTools or other
+  // auxiliary targets Chrome may open.
+  let appTargetId = null;
+
   browserWs.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data); } catch (_) { return; }
@@ -551,17 +556,40 @@ async function attachCDP(childProc, debugPort) {
     // setDiscoverTargets causes Chrome to emit targetCreated for all existing
     // targets immediately — so this handles both existing and future pages.
     if (msg.method === 'Target.targetCreated') {
-      const { targetId, type } = msg.params.targetInfo;
-      if (type === 'page' && !seenTargets.has(targetId)) {
-        seenTargets.add(targetId);
-        installGuard(targetId).catch(err => {
-          console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
-        });
+      const { targetId, type, url } = msg.params.targetInfo;
+      if (type !== 'page') return;
+      if (seenTargets.has(targetId)) return;
+      seenTargets.add(targetId);
+
+      // Identify our app target by URL origin. The first page target whose
+      // URL starts with our served origin is the app window. DevTools pages
+      // use chrome-devtools:// URLs and are never mistaken for the app.
+      if (!appTargetId) {
+        try {
+          const targetOrigin = new URL(url).origin;
+          const appOrigin    = new URL(appUrl).origin;
+          if (targetOrigin === appOrigin) {
+            appTargetId = targetId;
+            console.log('[browser] CDP: identified app target', targetId);
+          }
+        } catch (_) {
+          // Unparseable URL (e.g. about:blank during init) — not our target
+        }
       }
+
+      installGuard(targetId).catch(err => {
+        console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
+      });
       return;
     }
 
     if (msg.method === 'Target.targetDestroyed') {
+      const { targetId } = msg.params;
+
+      // Only shut down when the app window itself is destroyed, not when
+      // the user closes a DevTools panel or an auxiliary target exits.
+      if (targetId !== appTargetId) return;
+
       console.log('[browser] CDP: app window closed.');
       childProc.emit('windowClosed');
       browserWs.close();
@@ -628,7 +656,7 @@ async function launch({ url, cacheDir, buildId = 'stable', appName, debugPort = 
   });
 
   // Attach CDP asynchronously — don't block the caller waiting for it
-  attachCDP(child, debugPort).catch((err) => {
+  attachCDP(child, debugPort, url).catch((err) => {
     console.warn(`[browser] CDP setup error (non-fatal): ${err.message}`);
   });
 
