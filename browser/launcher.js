@@ -9,8 +9,10 @@
  *   3. Renaming the .app bundle on macOS (once) so the Dock, menu bar, and
  *      Mission Control show the application's own name
  *   4. Spawning the browser in --app mode with CDP enabled, returning the handle
- *   5. Attaching a CDP client that emits a 'windowClosed' event on the handle
- *      when the user closes the browser window (distinct from full process exit).
+ *   5. Attaching a CDP client that:
+ *        a) emits a 'windowClosed' event when the user closes the browser window
+ *        b) injects a navigation guard script into every new page target so the
+ *           app window cannot be navigated away from the served origin
  *
  * ── Window close detection via CDP ───────────────────────────────────────────
  *
@@ -233,6 +235,136 @@ function renameAppBundle(executablePath, appName) {
   }
 }
 
+
+// ─── Navigation guard script ──────────────────────────────────────────────────
+
+/**
+ * Injected into every new page target via Page.addScriptToEvaluateOnNewDocument.
+ *
+ * Runs before any page script and locks the window to its origin so the user
+ * cannot accidentally navigate away — e.g. by dropping a foreign URL onto the
+ * app window, clicking a misconfigured link, or a form submitting elsewhere.
+ *
+ * Same-origin navigation (hash changes, pushState, your own <a> tags) is
+ * explicitly allowed so downstream developers do not have to think about this.
+ *
+ * What is blocked:
+ *   - window.location assignments to a foreign origin
+ *   - window.location.assign() / replace() to a foreign origin
+ *   - <a> clicks that would navigate to a foreign origin
+ *   - <form> submissions targeting a foreign origin
+ *   - drag-and-drop of foreign URLs onto the window
+ *
+ * All blocks are silent (no alert, no console noise by default) so the guard
+ * is invisible during normal use. A single console.warn is emitted only when
+ * a block actually fires, which is useful during development.
+ */
+const NAVIGATION_GUARD_SCRIPT = `
+(function () {
+  'use strict';
+
+  const ALLOWED_ORIGIN = window.location.origin;
+
+  function isForeignUrl(url) {
+    if (!url) return false;
+    try {
+      // Relative URLs are always same-origin — allow them
+      const parsed = new URL(url, window.location.href);
+      return parsed.origin !== ALLOWED_ORIGIN;
+    } catch (_) {
+      return false; // Unparseable — allow and let the browser handle it
+    }
+  }
+
+  function block(reason, url) {
+    console.warn('[task-primer] Navigation blocked (' + reason + '):', url);
+    return false;
+  }
+
+  // ── window.location property overrides ─────────────────────────────────────
+  // We shadow the native location object with a Proxy so assignments to
+  // .href and calls to .assign/.replace are intercepted.
+  const nativeLocation = window.location;
+  const locationProxy  = new Proxy(nativeLocation, {
+    set(target, prop, value) {
+      if (prop === 'href' && isForeignUrl(value)) {
+        return block('location.href', value);
+      }
+      target[prop] = value;
+      return true;
+    },
+    get(target, prop) {
+      if (prop === 'assign') {
+        return function (url) {
+          if (isForeignUrl(url)) { block('location.assign', url); return; }
+          target.assign(url);
+        };
+      }
+      if (prop === 'replace') {
+        return function (url) {
+          if (isForeignUrl(url)) { block('location.replace', url); return; }
+          target.replace(url);
+        };
+      }
+      const val = target[prop];
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
+
+  try {
+    Object.defineProperty(window, 'location', {
+      get: () => locationProxy,
+      configurable: false,
+    });
+  } catch (_) {
+    // Some environments (e.g. sandboxed iframes) disallow this — skip silently
+  }
+
+  // ── <a> click interception ──────────────────────────────────────────────────
+  document.addEventListener('click', function (e) {
+    const anchor = e.target.closest('a[href]');
+    if (!anchor) return;
+    if (isForeignUrl(anchor.href)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      block('anchor click', anchor.href);
+    }
+  }, true); // capture phase — runs before any app listener
+
+  // ── <form> submit interception ──────────────────────────────────────────────
+  document.addEventListener('submit', function (e) {
+    const form   = e.target;
+    const action = form.action || window.location.href;
+    if (isForeignUrl(action)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      block('form submit', action);
+    }
+  }, true);
+
+  // ── Drag-and-drop interception ──────────────────────────────────────────────
+  // A URL dragged from another window and dropped on the app would normally
+  // trigger a navigation. We block the drop entirely; dragover must also be
+  // prevented otherwise the browser ignores the drop handler.
+  document.addEventListener('dragover', function (e) {
+    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'none';
+    }
+  }, true);
+
+  document.addEventListener('drop', function (e) {
+    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const url = e.dataTransfer.getData('text/uri-list');
+      block('drag-and-drop', url);
+    }
+  }, true);
+
+})();
+`;
+
 // ─── CDP client ───────────────────────────────────────────────────────────────
 
 /**
@@ -302,7 +434,7 @@ async function attachCDP(childProc, debugPort) {
   let msgId = 1;
 
   ws.on('open', () => {
-    // Enable Target domain events so we receive targetDestroyed notifications
+    // Enable Target domain events — gives us targetCreated and targetDestroyed
     ws.send(JSON.stringify({
       id:     msgId++,
       method: 'Target.setDiscoverTargets',
@@ -310,9 +442,42 @@ async function attachCDP(childProc, debugPort) {
     }));
   });
 
+  // Helper: send a CDP command to a specific session (attached target)
+  function sessionSend(sessionId, method, params) {
+    ws.send(JSON.stringify({ id: msgId++, sessionId, method, params: params || {} }));
+  }
+
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data); } catch (_) { return; }
+
+    // targetCreated fires when Chrome opens a new page/frame target.
+    // We attach to it and inject the navigation guard before any page code runs.
+    if (msg.method === 'Target.targetCreated') {
+      const { targetId, type } = msg.params.targetInfo;
+      if (type !== 'page') return; // Only care about page targets
+
+      // Attach to the target to get a sessionId for page-level commands
+      ws.send(JSON.stringify({
+        id:     msgId++,
+        method: 'Target.attachToTarget',
+        params: { targetId, flatten: true },
+      }));
+    }
+
+    // attachedToTarget gives us the sessionId we need for page-level commands
+    if (msg.method === 'Target.attachedToTarget') {
+      const { sessionId } = msg.params;
+
+      // Inject the navigation guard — runs before any page script on every
+      // document load, including navigations within the same target
+      sessionSend(sessionId, 'Page.addScriptToEvaluateOnNewDocument', {
+        source: NAVIGATION_GUARD_SCRIPT,
+      });
+
+      // Also enable Page events so we can log guard activity if needed
+      sessionSend(sessionId, 'Page.enable', {});
+    }
 
     // targetDestroyed fires when any target (page, worker, etc.) is closed.
     // In --app mode there is exactly one page target — the app window itself.
