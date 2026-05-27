@@ -58,6 +58,14 @@ async function boot() {
   // ── Misc ──────────────────────────────────────────────────────────────────
   fastify.get('/health', async () => ({ ok: true }));
 
+  // Public config endpoint — exposes the subset of package.json values
+  // that the UI needs (e.g. appName for document.title). Add keys here
+  // as the UI grows; never expose sensitive values through this route.
+  const taskPrimerCfg = require('../package.json').taskPrimer || {};
+  fastify.get('/config', async () => ({
+    appName: taskPrimerCfg.appName || 'Task Primer',
+  }));
+
   await fastify.listen({ port: PORT, host: HOST });
 
   if (process.send) {

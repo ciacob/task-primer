@@ -131,6 +131,16 @@
     _origConnect();
   };
 
+  // Fetch app config and apply appName to the window title and heading.
+  // This is the only place document.title is set — adapter is the
+  // sole conduit to the server, consistent with the rest of the UI layer.
+  adapter.getConfig().then((cfg) => {
+    if (cfg && cfg.appName) {
+      document.title = cfg.appName;
+      document.querySelector('h1 span.appName').textContent = cfg.appName;
+    }
+  }).catch(() => { /* non-fatal — title stays as default */ });
+
   adapter.connect();
   logEntry('UI ready. Waiting for worker…');
 })();

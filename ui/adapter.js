@@ -91,6 +91,10 @@
 
     // ─── Public API ───────────────────────────────────────────────────────────
 
+    getConfig() {
+      return this._get('/config');
+    }
+
     getStatus() {
       return this._get('/worker/status');
     }
