@@ -102,9 +102,10 @@ All browser-related settings live in `package.json` under `taskPrimer`:
 "taskPrimer": {
   "appName": "Task Primer",
   "browser": {
-    "product":  "chrome",
-    "buildId":  "stable",
-    "cacheDir": ".browsers"
+    "product":   "chrome",
+    "buildId":   "stable",
+    "cacheDir":  ".browsers",
+    "debugPort": 9222
   }
 }
 ```
@@ -112,14 +113,23 @@ All browser-related settings live in `package.json` under `taskPrimer`:
 **`appName`** — the name shown in the macOS Dock, menu bar (the bold app name
 at the far left), and Mission Control. On first launch after download, the
 launcher patches `CFBundleName` and `CFBundleDisplayName` in the `.app` bundle's
-`Info.plist` using macOS's built-in `plutil` tool. A sentinel file next to the
-plist records the last-applied name so the patch runs only once — or again if
-the name is changed in `package.json`. Has no effect on Linux or Windows.
-Set to `null` or omit to skip renaming entirely.
+`Info.plist` using macOS's built-in `plutil` tool, then calls `lsregister -f`
+to flush the Launch Services cache so the Dock picks up the new name immediately.
+A sentinel file next to the plist records the last-applied name so the patch
+runs only once — or again if the name is changed in `package.json`. Has no
+effect on Linux or Windows. Set to `null` or omit to skip renaming entirely.
 
 > **Note:** the macOS menu bar *entries* (File, Edit, View, …) are controlled
 > by Chrome's internals and cannot be customised via plist or flags. Only the
 > app name — the bold item at the far left of the menu bar — is affected.
+
+**`debugPort`** — the port Chrome's remote debugging (CDP) endpoint listens on.
+The launcher attaches a lightweight CDP client on this port to detect when the
+user closes the app window via the red button — a signal that does not reliably
+produce a process `exit` event on macOS. Change this if port `9222` conflicts
+with other tooling (e.g. another Chrome instance or a debugger).
+The CDP client emits a `windowClosed` event on the browser process handle;
+`main.js` listens to both `windowClosed` and `exit` for full coverage.
 
 **`buildId: "stable"`** is a channel name, not a revision number. At download
 time, `@puppeteer/browsers` resolves it to the latest Chrome for Testing stable

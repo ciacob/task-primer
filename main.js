@@ -229,20 +229,38 @@ async function launchBrowser() {
   const cacheDir      = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
   const buildId       = browserCfg.buildId || 'stable';
   const appName       = taskPrimerCfg.appName || null;
+  const debugPort     = browserCfg.debugPort || 9222;
 
   try {
-    browserProc = await launch({ url: SERVER_URL, cacheDir, buildId, appName });
+    browserProc = await launch({ url: SERVER_URL, cacheDir, buildId, appName, debugPort });
 
-    log('browser', `launched (pid=${browserProc.pid})`);
+    log('browser', `launched (pid=${browserProc.pid}, cdp=:${debugPort})`);
 
-    browserProc.on('exit', (code, signal) => {
-      log('browser', `window closed (code=${code}, signal=${signal})`);
-
+    // 'windowClosed' is emitted by the CDP client in launcher.js when the
+    // user closes the app window via the red button. This is the primary
+    // signal for --autoexit and fires before (or instead of) 'exit'.
+    browserProc.on('windowClosed', () => {
+      log('browser', 'window closed (CDP)');
       if (argv.autoexit) {
         log('main', '--autoexit: browser window closed, shutting down');
         shutdown('browser-exit');
       }
     });
+
+    // 'exit' fires on full process termination (Cmd+Q, kill signal).
+    // Guard with a flag so we don't double-shutdown if 'windowClosed' already ran.
+    let shuttingDown = false;
+    browserProc.on('exit', (code, signal) => {
+      log('browser', `process exited (code=${code}, signal=${signal})`);
+      if (argv.autoexit && !shuttingDown) {
+        shuttingDown = true;
+        log('main', '--autoexit: browser process exited, shutting down');
+        shutdown('browser-exit');
+      }
+    });
+
+    // Set the flag when windowClosed fires so exit doesn't double-trigger
+    browserProc.on('windowClosed', () => { shuttingDown = true; });
 
   } catch (err) {
     log('browser', `launch failed: ${err.message}`);

@@ -3,77 +3,71 @@
 /**
  * browser/launcher.js
  *
- * Responsible for four things:
+ * Responsible for five things:
  *   1. Resolving the correct Chrome for Testing binary for the current platform
  *   2. Downloading it (once) if not already cached in <cacheDir>
  *   3. Renaming the .app bundle on macOS (once) so the Dock, menu bar, and
- *      Mission Control show the application's own name instead of
- *      "Google Chrome for Testing"
- *   4. Spawning the browser in --app mode and returning the child process handle
+ *      Mission Control show the application's own name
+ *   4. Spawning the browser in --app mode with CDP enabled, returning the handle
+ *   5. Attaching a CDP client that emits a 'windowClosed' event on the handle
+ *      when the user closes the browser window (distinct from full process exit).
  *
- * The returned handle is a standard Node.js ChildProcess. Callers attach
- * .on('exit', ...) to detect window close without any platform heuristics —
- * the browser is our direct child process, so exit detection is reliable.
+ * ── Window close detection via CDP ───────────────────────────────────────────
  *
- * ── Build resolution ─────────────────────────────────────────────────────────
+ *   In --app mode on macOS, clicking the red close button hides the window but
+ *   does not necessarily exit the Chrome process. The ChildProcess 'exit' event
+ *   only fires on full process termination (Cmd+Q, kill signal, etc.), making
+ *   it unsuitable for detecting "user is done with the UI".
  *
- *   By default, buildId is set to 'stable' in package.json under
- *   taskPrimer.browser.buildId. This is a channel name, not a revision number.
- *   @puppeteer/browsers resolves it at download time to the latest Chrome for
- *   Testing stable release that has verified downloads for all platforms:
+ *   Chrome DevTools Protocol (CDP) provides the correct signal:
+ *   Target.targetDestroyed fires immediately when the app window is closed,
+ *   regardless of whether the underlying process exits.
  *
- *     linux64, mac-arm64, mac-x64, win32, win64
+ *   The launcher:
+ *     - Adds --remote-debugging-port=<debugPort> to the launch args
+ *     - After spawn, polls the CDP /json/version endpoint until Chrome is ready
+ *     - Opens a WebSocket to the browser-level CDP target
+ *     - Subscribes to Target.setDiscoverTargets and listens for targetDestroyed
+ *     - Emits 'windowClosed' on the ChildProcess handle when the target is gone
  *
- *   The resolved binary is cached in <cacheDir> and reused on every subsequent
- *   run — resolution and download only happen once.
+ *   Callers should listen to BOTH events for full coverage:
+ *     browserProc.on('windowClosed', ...) — window closed (red button)
+ *     browserProc.on('exit', ...)         — full process quit (Cmd+Q, kill)
  *
- *   Why 'stable' and not a hardcoded revision?
- *   Revision numbers in Chrome for Testing are not guaranteed to have builds
- *   for all platforms. The stable channel endpoint is the only authoritative
- *   source of a version that is confirmed cross-platform. Hardcoding a revision
- *   that works on one platform and silently 404s on another is a maintenance trap.
- *
- * ── Pinning (optional) ───────────────────────────────────────────────────────
- *
- *   If reproducibility matters more than staying current, replace 'stable'
- *   in package.json with an exact version string, e.g. '124.0.6367.207'.
- *   Use only versions listed at:
- *     https://googlechromelabs.github.io/chrome-for-testing/
- *   Verify the version has a 200 for your target platforms before committing.
- *   After changing the version, delete .browsers/ to force a fresh download.
+ *   The CDP client is intentionally minimal — no library dependency, just the
+ *   'ws' package already present in the project.
  *
  * ── macOS app rename ─────────────────────────────────────────────────────────
  *
- *   On macOS, the Dock icon label, menu bar app name, and Mission Control
- *   entry all read from the .app bundle's Info.plist — specifically the keys
- *   CFBundleName and CFBundleDisplayName. We patch these once after download
- *   using macOS's built-in `plutil` tool (no extra dependency).
- *
- *   The desired name comes from taskPrimer.appName in package.json.
+ *   Patches CFBundleName and CFBundleDisplayName in the .app bundle's
+ *   Info.plist using macOS's built-in plutil tool, then re-registers the
+ *   bundle with Launch Services (lsregister) to flush the Dock's name cache.
+ *   Both tools are macOS system utilities — no extra dependency.
  *
  *   A sentinel file (<bundle>/Contents/.last-rename) records the last name
- *   written. The patch is skipped if the sentinel matches the desired name,
- *   so it runs exactly once per build per name — safe to call on every launch.
+ *   written. The patch is skipped if the sentinel matches the desired name.
  *
- *   Note on menu content: the macOS menu bar entries (File, Edit, View, etc.)
- *   are controlled by Chrome's internals and cannot be customised via plist
- *   or command-line flags. Only the app name (the bold item at the far left)
- *   is affected by this patch.
+ *   Note: menu bar *entries* (File, Edit, View, …) are Chrome internals and
+ *   cannot be customised. Only the bold app name at the far left is affected.
+ *
+ * ── Build resolution ─────────────────────────────────────────────────────────
+ *
+ *   buildId 'stable' is resolved at download time to the current cross-platform
+ *   stable release via @puppeteer/browsers. See package.json taskPrimer.browser
+ *   for pin/update instructions.
  *
  * ── pkg compatibility ────────────────────────────────────────────────────────
  *
- *   The browser binary lives in <cacheDir> on disk, outside any bundle.
- *   This file uses only @puppeteer/browsers (pure JS, no native addons)
- *   and Node built-ins. Both bundle cleanly with pkg.
- *
- *   When packaging with pkg, set cacheDir to a path relative to the
- *   executable (e.g. path.join(path.dirname(process.execPath), '.browsers'))
- *   so the cache survives next to the binary rather than relative to __dirname.
+ *   Binary lives in <cacheDir> outside any bundle. This file uses only
+ *   @puppeteer/browsers, ws (already a project dependency), and Node built-ins.
+ *   All bundle cleanly with pkg.
  */
 
-const path      = require('path');
-const fs        = require('fs');
+const path                = require('path');
+const fs                  = require('fs');
+const http                = require('http');
 const { spawn, execSync } = require('child_process');
+const WebSocket           = require('ws');
 const {
   install,
   resolveBuildId,
@@ -84,34 +78,31 @@ const {
 // ─── Launch flags ─────────────────────────────────────────────────────────────
 
 /**
- * --app=<url>
- *   Opens in a frameless app window — no address bar, no tab strip.
- *   Makes the browser behave like a dedicated native app window and ensures
- *   a single, clean process tree that we can watch for exit.
+ * Build the Chromium launch argument list.
  *
- * --no-first-run / --no-default-browser-check
- *   Suppress first-launch setup prompts.
+ * --app=<url>              Frameless app window — no address bar, no tab strip.
+ * --no-first-run           Skip first-launch setup prompts.
+ * --no-default-browser-check  No "make Chrome your default" prompt.
+ * --disable-extensions     No extension UI.
+ * --disable-translate      No translation bar.
+ * --disable-infobars       Suppresses the "Chrome for Testing" notification bar.
+ * --remote-debugging-port  Enables CDP so we can detect window close reliably.
  *
- * --disable-extensions / --disable-translate
- *   Keep the window clean; no extension UI, no translation bar.
+ * Linux: --no-sandbox added because most container/CI environments lack the
+ * kernel namespace support Chrome's sandbox requires.
  *
- * --disable-infobars
- *   Suppresses the "Chrome is being controlled by automated software" and
- *   "Chrome for Testing is only for automated testing" notification bars.
- *
- * Linux sandbox note:
- *   --no-sandbox is added on Linux because most container and CI environments
- *   disable the kernel namespacing that Chrome's sandbox requires.
- *   Remove it if your Linux environment supports user namespaces.
+ * @param {string} url
+ * @param {number} debugPort
  */
-function buildLaunchArgs(url) {
+function buildLaunchArgs(url, debugPort) {
   const args = [
     `--app=${url}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-extensions',
     '--disable-translate',
-    '--disable-infobars'
+    '--disable-infobars',
+    `--remote-debugging-port=${debugPort}`,
   ];
 
   if (process.platform === 'linux') {
@@ -125,7 +116,7 @@ function buildLaunchArgs(url) {
 
 /**
  * Ensure the requested Chrome for Testing build is present in cacheDir.
- * Downloads it if missing; skips silently if already cached.
+ * Downloads if missing; skips silently if already cached.
  *
  * @param {string} cacheDir   Absolute path to the cache directory.
  * @param {string} buildId    Channel name ('stable') or exact version string.
@@ -184,26 +175,22 @@ async function ensureChromium(cacheDir, buildId) {
 // ─── macOS app bundle rename ──────────────────────────────────────────────────
 
 /**
- * Patch CFBundleName and CFBundleDisplayName in the .app bundle's Info.plist
- * so the Dock, menu bar, and Mission Control show `appName` instead of
- * "Google Chrome for Testing".
+ * Patch Info.plist and flush the Launch Services cache so the Dock, menu bar,
+ * and Mission Control all reflect appName instead of "Google Chrome for Testing".
  *
- * No-ops silently on non-macOS platforms.
- * No-ops if the bundle has already been patched with this exact name.
- * Logs a warning (does not throw) if the patch fails — a cosmetic failure
- * should never prevent the app from launching.
+ * No-ops silently on non-macOS. Warns but does not throw on failure.
  *
  * @param {string} executablePath  Absolute path to the browser binary.
- * @param {string} appName         The desired application name.
+ * @param {string} appName         Desired application name.
  */
 function renameAppBundle(executablePath, appName) {
   if (process.platform !== 'darwin') { return; }
   if (!appName) { return; }
 
-  // Executable lives at:
-  //   <bundle>/Contents/MacOS/<binary-name>
-  // Two levels up from the binary lands in Contents/, where Info.plist lives.
+  // Binary is at <bundle>/Contents/MacOS/<name>
+  // Two levels up lands in Contents/, where Info.plist lives.
   const bundleContents = path.resolve(executablePath, '..', '..');
+  const bundlePath     = path.resolve(bundleContents, '..');   // the .app itself
   const plistPath      = path.join(bundleContents, 'Info.plist');
   const sentinelPath   = path.join(bundleContents, '.last-rename');
 
@@ -212,7 +199,7 @@ function renameAppBundle(executablePath, appName) {
     return;
   }
 
-  // Check sentinel: skip if already patched with this exact name.
+  // Skip if already patched with this exact name
   try {
     const last = fs.readFileSync(sentinelPath, 'utf8').trim();
     if (last === appName) return;  // Already correct — nothing to do
@@ -227,45 +214,167 @@ function renameAppBundle(executablePath, appName) {
     execSync(`plutil -replace CFBundleName        -string ${q} "${plistPath}"`);
     execSync(`plutil -replace CFBundleDisplayName -string ${q} "${plistPath}"`);
 
+    // Flush the Launch Services database so the Dock picks up the new name.
+    // lsregister is a macOS system tool — always present, no dependency.
+    const lsregister =
+      '/System/Library/Frameworks/CoreServices.framework' +
+      '/Versions/A/Frameworks/LaunchServices.framework' +
+      '/Versions/A/Support/lsregister';
+
+    execSync(`"${lsregister}" -f "${bundlePath}"`);
+
     // Write sentinel so we don't re-patch on every launch
     fs.writeFileSync(sentinelPath, appName, 'utf8');
 
-    console.log(`[browser] App bundle renamed to "${appName}".`);
+    console.log(`[browser] App bundle renamed to "${appName}" (Dock cache flushed).`);
   } catch (err) {
     // Cosmetic failure — warn but don't abort the launch
     console.warn(`[browser] App rename failed (non-fatal): ${err.message}`);
   }
 }
 
+// ─── CDP client ───────────────────────────────────────────────────────────────
+
+/**
+ * Poll the CDP /json/version endpoint until Chrome is ready.
+ *
+ * @param {number} port
+ * @param {number} [retries=20]
+ * @param {number} [delayMs=200]
+ * @returns {Promise<string>} The browser-level WebSocket debugger URL.
+ */
+function waitForCDP(port, retries = 20, delayMs = 200) {
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+
+    const try_ = () => {
+      http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
+        let body = '';
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          try {
+            const info = JSON.parse(body);
+            if (info.webSocketDebuggerUrl) {
+              resolve(info.webSocketDebuggerUrl);
+            } else {
+              retry();
+            }
+          } catch (_) {
+            retry();
+          }
+        });
+      }).on('error', retry);
+    };
+
+    const retry = () => {
+      attempts++;
+      if (attempts >= retries) {
+        reject(new Error(`CDP not ready after ${retries} attempts on port ${port}`));
+        return;
+      }
+      setTimeout(try_, delayMs);
+    };
+
+    try_();
+  });
+}
+
+/**
+ * Attach a CDP client to the browser and emit 'windowClosed' on childProc
+ * when the app window's target is destroyed.
+ *
+ * Uses only the 'ws' package already present in the project — no cdp library.
+ *
+ * @param {import('child_process').ChildProcess} childProc
+ * @param {number} debugPort
+ */
+async function attachCDP(childProc, debugPort) {
+  let wsUrl;
+  try {
+    wsUrl = await waitForCDP(debugPort);
+  } catch (err) {
+    console.warn(`[browser] CDP attach failed (non-fatal): ${err.message}`);
+    console.warn('[browser] Window-close detection will fall back to process exit.');
+    return;
+  }
+
+  const ws = new WebSocket(wsUrl);
+  let msgId = 1;
+
+  ws.on('open', () => {
+    // Enable Target domain events so we receive targetDestroyed notifications
+    ws.send(JSON.stringify({
+      id:     msgId++,
+      method: 'Target.setDiscoverTargets',
+      params: { discover: true },
+    }));
+  });
+
+  ws.on('message', (data) => {
+    let msg;
+    try { msg = JSON.parse(data); } catch (_) { return; }
+
+    // targetDestroyed fires when any target (page, worker, etc.) is closed.
+    // In --app mode there is exactly one page target — the app window itself.
+    if (msg.method === 'Target.targetDestroyed') {
+      console.log('[browser] CDP: app window closed.');
+      childProc.emit('windowClosed');
+      ws.close();
+    }
+  });
+
+  ws.on('error', (err) => {
+    // Non-fatal: CDP is a best-effort enhancement
+    console.warn(`[browser] CDP WebSocket error (non-fatal): ${err.message}`);
+  });
+
+  ws.on('close', () => {
+    // If the WebSocket closes without us explicitly closing it (e.g. Chrome
+    // crashed or was killed), treat it as a window-closed signal too so
+    // --autoexit still works in those cases.
+    if (childProc && !childProc.killed) {
+      childProc.emit('windowClosed');
+    }
+  });
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Ensure the browser is cached, rename the app bundle if needed, then launch.
+ * Ensure the browser is cached, rename the app bundle if needed, spawn, and
+ * attach the CDP window-close detector.
  *
  * @param {object} options
- * @param {string} options.url      The URL to open in the app window.
- * @param {string} options.cacheDir Absolute path to the browser cache dir.
- * @param {string} options.buildId  Channel name or exact version (default: 'stable').
- * @param {string} [options.appName] Desired app name for macOS Dock/menu bar.
- *                                   Omit or pass null to skip renaming.
+ * @param {string} options.url         URL to open in the app window.
+ * @param {string} options.cacheDir    Absolute path to the browser cache dir.
+ * @param {string} options.buildId     Channel name or exact version (default: 'stable').
+ * @param {string} [options.appName]   Desired macOS app name. Null to skip.
+ * @param {number} [options.debugPort] CDP remote debugging port (default: 9222).
  *
  * @returns {Promise<import('child_process').ChildProcess>}
- *   The spawned browser process. Listen to .on('exit') for window close.
+ *   The spawned browser process. Listen to:
+ *     .on('windowClosed', fn)  — user closed the app window (red button)
+ *     .on('exit', fn)          — full process termination (Cmd+Q, kill)
  */
-async function launch({ url, cacheDir, buildId = 'stable', appName }) {
+async function launch({ url, cacheDir, buildId = 'stable', appName, debugPort = 9222 }) {
   const executablePath = await ensureChromium(cacheDir, buildId);
 
   renameAppBundle(executablePath, appName);
 
   console.log(`[browser] Launching Chrome for Testing → ${url}`);
 
-  const child = spawn(executablePath, buildLaunchArgs(url), {
+  const child = spawn(executablePath, buildLaunchArgs(url, debugPort), {
     detached: false,    // Keep the browser as a child of this process
     stdio:    'ignore', // Chrome for Testing is chatty; silence it
   });
 
   child.on('error', (err) => {
     console.error(`[browser] Failed to spawn browser: ${err.message}`);
+  });
+
+  // Attach CDP asynchronously — don't block the caller waiting for it
+  attachCDP(child, debugPort).catch((err) => {
+    console.warn(`[browser] CDP setup error (non-fatal): ${err.message}`);
   });
 
   return child;

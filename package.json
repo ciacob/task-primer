@@ -17,6 +17,7 @@
       "product":  "chrome",
       "buildId":  "stable",
       "cacheDir": ".browsers",
+      "debugPort": 9222,
       "notes": [
         "buildId 'stable' resolves to the latest Chrome for Testing stable release",
         "at download time via the @puppeteer/browsers channel resolution API.",
