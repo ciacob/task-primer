@@ -111,7 +111,7 @@ function buildLaunchArgs(url) {
     '--no-default-browser-check',
     '--disable-extensions',
     '--disable-translate',
-    '--disable-infobars',
+    '--disable-infobars'
   ];
 
   if (process.platform === 'linux') {
@@ -202,8 +202,8 @@ function renameAppBundle(executablePath, appName) {
 
   // Executable lives at:
   //   <bundle>/Contents/MacOS/<binary-name>
-  // So Info.plist is exactly 3 levels up, then into Contents/.
-  const bundleContents = path.resolve(executablePath, '..', '..', '..');
+  // Two levels up from the binary lands in Contents/, where Info.plist lives.
+  const bundleContents = path.resolve(executablePath, '..', '..');
   const plistPath      = path.join(bundleContents, 'Info.plist');
   const sentinelPath   = path.join(bundleContents, '.last-rename');
 
