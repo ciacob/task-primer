@@ -175,7 +175,13 @@ The navigation guard, injected before any page code runs, blocks: `window.locati
 
 The project is CJS throughout. Three things need attention when bundling with `pkg`:
 
-**Task modules** are loaded via a runtime-computed path and cannot be statically traced. Ship them as external files alongside the binary.
+**Task modules** are loaded via a runtime-computed path, so `pkg`'s static analyser won't trace them automatically. Declare them explicitly as `pkg` assets in `package.json` and they will be available on disk at the expected path relative to the executable:
+
+```json
+"pkg": {
+  "assets": ["ui/**", "tasks/**"]
+}
+```
 
 **Chrome for Testing binary** lives in `.browsers/` outside any bundle. When packaging, redirect `cacheDir` to sit next to the executable:
 ```js
