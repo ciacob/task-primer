@@ -17,10 +17,11 @@ main.js  (orchestrator)
 
 ```bash
 npm install
-node main.js                        # headless — REST API on the configured webPort
+node main.js                        # headless — ports auto-picked on first run
 node main.js --ui                   # + download Chrome once, open app window
 node main.js --ui --autoexit        # + exit when the window is closed
 node main.js --worker-crash=restart # restart worker on unexpected crash
+node pickPorts.js --override        # manually re-pick ports if there's a later clash
 ```
 
 ---
@@ -124,11 +125,11 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
 }
 ```
 
-**`webPort`** — the port the Fastify web server listens on. Set to `null` initially — `pickPorts.js` writes a free port on first run.
+**`webPort`** — the port the Fastify web server listens on. Set to `null` initially — on first launch `main.js` automatically runs `pickPorts.js` to pick and write a free port. Run `node pickPorts.js --override` manually to re-pick if a port gets claimed.
 
 **`webHost`** — the bind address for the web server. Defaults to `127.0.0.1` (loopback only). Change to `0.0.0.0` to accept connections from other machines on the network.
 
-**`browser.debugPort`** — Chrome's CDP remote debugging port, used internally for window-close detection, navigation guard injection, and target lifecycle management. Also `null` initially, written by `pickPorts.js`.
+**`browser.debugPort`** — Chrome's CDP remote debugging port, used internally for window-close detection, navigation guard injection, and target lifecycle management. Also `null` initially, auto-picked alongside `webPort` on first launch.
 
 **`appName`** — window title and `<h1>` heading. On macOS also patches the `.app` bundle's `Info.plist` so the menu bar shows the correct name. The Dock name cannot be changed reliably on macOS without a system restart.
 

@@ -309,8 +309,9 @@ async function boot() {
   const pkgWeb = tp.webPort;
   const pkgDbg = tp.browser && tp.browser.debugPort;
 
-  // If --ui and either port is unset, run pickPorts.js first
-  if (argv.ui && (pkgWeb == null || pkgDbg == null)) {
+  // If either port is unset, run pickPorts.js — regardless of --ui.
+  // Port clashes are just as relevant in headless mode.
+  if (pkgWeb == null || pkgDbg == null) {
     log('main', 'ports not set — running pickPorts.js…');
     try {
       execFileSync(process.execPath, [path.join(__dirname, 'pickPorts.js')], {
