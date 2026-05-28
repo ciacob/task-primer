@@ -28,7 +28,7 @@
  * in shared/messages.js.
  */
 
-const { fork }    = require('child_process');
+const { fork, execFileSync } = require('child_process');
 const path        = require('path');
 const yargs       = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
@@ -48,16 +48,6 @@ const argv = yargs(hideBin(process.argv))
     default:     false,
     description: 'Exit the application when the Chromium window is closed (requires --ui)',
   })
-  .option('port', {
-    type:        'number',
-    default:     3000,
-    description: 'Port for the web server',
-  })
-  .option('host', {
-    type:        'string',
-    default:     '127.0.0.1',
-    description: 'Host/interface for the web server',
-  })
   .option('worker-crash', {
     choices:     ['restart', 'report'],
     default:     'report',
@@ -73,7 +63,11 @@ const argv = yargs(hideBin(process.argv))
   .argv;
 
 const WORKER_CRASH_POLICY = argv['workerCrash'] || argv['worker-crash'];
-const SERVER_URL           = `http://${argv.host}:${argv.port}`;
+
+// Resolved in boot() after port-picking; used everywhere thereafter.
+let SERVER_URL = '';
+let WEB_PORT   = 0;
+let WEB_HOST   = '127.0.0.1';
 
 // ─── Shared worker state (owned by main) ─────────────────────────────────────
 
@@ -175,8 +169,8 @@ function spawnServer() {
     silent: false,
     env: {
       ...process.env,
-      SERVER_PORT: String(argv.port),
-      SERVER_HOST: argv.host,
+      SERVER_PORT: String(WEB_PORT),
+      SERVER_HOST: WEB_HOST,
     },
   });
 
@@ -306,15 +300,52 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // ─── Boot sequence ────────────────────────────────────────────────────────────
 
-log('main', [
-  `starting`,
-  `port=${argv.port}`,
-  `ui=${argv.ui}`,
-  `autoexit=${argv.autoexit}`,
-  `worker-crash=${WORKER_CRASH_POLICY}`,
-].join('  '));
+async function boot() {
 
-workerProc = spawnWorker();
-serverProc = spawnServer();
-// Browser is launched inside spawnServer()'s SRV.READY handler,
-// ensuring the server is accepting connections before Chromium loads the page.
+  // ── Port resolution ──────────────────────────────────────────────────────
+  // Priority: CLI flag → package.json → auto-pick (first --ui run)
+  const pkg    = require('./package.json');
+  const tp     = pkg.taskPrimer || {};
+  const pkgWeb = tp.webPort;
+  const pkgDbg = tp.browser && tp.browser.debugPort;
+
+  // If --ui and either port is unset, run pickPorts.js first
+  if (argv.ui && (pkgWeb == null || pkgDbg == null)) {
+    log('main', 'ports not set — running pickPorts.js…');
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, 'pickPorts.js')], {
+        stdio: 'inherit',
+      });
+    } catch (err) {
+      log('main', `pickPorts failed: ${err.message} — using fallback defaults`);
+    }
+    // Re-read package.json after pickPorts may have written to it
+    delete require.cache[require.resolve('./package.json')];
+  }
+
+  // Resolve final values from package.json (written by pickPorts.js)
+  const freshPkg = require('./package.json').taskPrimer || {};
+  WEB_PORT   = freshPkg.webPort  || 3000;
+  WEB_HOST   = freshPkg.webHost  || '127.0.0.1';
+
+  SERVER_URL = `http://${WEB_HOST}:${WEB_PORT}`;
+
+  log('main', [
+    `starting`,
+    `port=${WEB_PORT}`,
+    `host=${WEB_HOST}`,
+    `ui=${argv.ui}`,
+    `autoexit=${argv.autoexit}`,
+    `worker-crash=${WORKER_CRASH_POLICY}`,
+  ].join('  '));
+
+  workerProc = spawnWorker();
+  serverProc = spawnServer();
+  // Browser is launched inside spawnServer()'s SRV.READY handler,
+  // ensuring the server is accepting connections before Chromium loads the page.
+}
+
+boot().catch((err) => {
+  console.error('[main] Fatal boot error:', err);
+  process.exit(1);
+});

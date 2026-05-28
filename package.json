@@ -13,6 +13,8 @@
   },
   "taskPrimer": {
     "appName": "Task Primer",
+    "webPort":  6321,
+    "webHost":  "127.0.0.1",
 
     "window": {
       "width":  null,
@@ -29,7 +31,7 @@
       "product":  "chrome",
       "buildId":  "stable",
       "cacheDir": ".browsers",
-      "debugPort": 9222,
+      "debugPort": 8120,
       "notes": [
         "buildId 'stable' resolves to the latest Chrome for Testing stable release",
         "at download time via the @puppeteer/browsers channel resolution API.",

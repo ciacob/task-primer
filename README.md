@@ -17,7 +17,7 @@ main.js  (orchestrator)
 
 ```bash
 npm install
-node main.js                        # headless — REST API on port 3000
+node main.js                        # headless — REST API on the configured webPort
 node main.js --ui                   # + download Chrome once, open app window
 node main.js --ui --autoexit        # + exit when the window is closed
 node main.js --worker-crash=restart # restart worker on unexpected crash
@@ -29,8 +29,6 @@ node main.js --worker-crash=restart # restart worker on unexpected crash
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `3000` | Web server port |
-| `--host` | `127.0.0.1` | Bind address |
 | `--ui` | `false` | Launch the browser UI |
 | `--autoexit` | `false` | Exit when the browser window closes (requires `--ui`) |
 | `--worker-crash` | `report` | `report` or `restart` on unexpected worker exit |
@@ -105,11 +103,13 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
 ```json
 "taskPrimer": {
   "appName": "Task Primer",
+  "webPort":  6321,
+  "webHost":  "127.0.0.1",
 
   "browser": {
     "buildId":   "stable",
     "cacheDir":  ".browsers",
-    "debugPort": 9222
+    "debugPort": 8120
   },
 
   "window": {
@@ -123,6 +123,12 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
   }
 }
 ```
+
+**`webPort`** — the port the Fastify web server listens on. Set to `null` initially — `pickPorts.js` writes a free port on first run.
+
+**`webHost`** — the bind address for the web server. Defaults to `127.0.0.1` (loopback only). Change to `0.0.0.0` to accept connections from other machines on the network.
+
+**`browser.debugPort`** — Chrome's CDP remote debugging port, used internally for window-close detection, navigation guard injection, and target lifecycle management. Also `null` initially, written by `pickPorts.js`.
 
 **`appName`** — window title and `<h1>` heading. On macOS also patches the `.app` bundle's `Info.plist` so the menu bar shows the correct name. The Dock name cannot be changed reliably on macOS without a system restart.
 
