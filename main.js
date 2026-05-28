@@ -225,14 +225,32 @@ async function launchBrowser() {
   // are configurable without touching code. cacheDir is resolved relative
   // to the project root; see README for the pkg packaging note.
   const taskPrimerCfg = require('./package.json').taskPrimer || {};
-  const browserCfg    = taskPrimerCfg.browser || {};
-  const cacheDir      = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
-  const buildId       = browserCfg.buildId || 'stable';
-  const appName       = taskPrimerCfg.appName || null;
-  const debugPort     = browserCfg.debugPort || 9222;
+  const browserCfg    = taskPrimerCfg.browser   || {};
+  const windowCfg     = taskPrimerCfg.window    || {};
+  const securityCfg   = taskPrimerCfg.security  || {};
+
+  const cacheDir       = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
+  const buildId        = browserCfg.buildId  || 'stable';
+  const appName        = taskPrimerCfg.appName || null;
+  const debugPort      = browserCfg.debugPort != null ? browserCfg.debugPort : 9222;
+
+  // Window geometry — null means "let Chrome decide" (uses remembered size/position)
+  const windowWidth    = windowCfg.width  != null ? windowCfg.width  : null;
+  const windowHeight   = windowCfg.height != null ? windowCfg.height : null;
+  const windowX        = windowCfg.x      != null ? windowCfg.x      : null;
+  const windowY        = windowCfg.y      != null ? windowCfg.y      : null;
+
+  // Security defaults are dev-friendly (everything allowed)
+  const devTools        = securityCfg.devTools        !== false;
+  const allowNewWindows = securityCfg.allowNewWindows !== false;
+  const allowRefresh    = securityCfg.allowRefresh    !== false;
 
   try {
-    browserProc = await launch({ url: SERVER_URL, cacheDir, buildId, appName, debugPort });
+    browserProc = await launch({
+      url: SERVER_URL, cacheDir, buildId, appName, debugPort,
+      windowWidth, windowHeight, windowX, windowY,
+      devTools, allowNewWindows, allowRefresh,
+    });
 
     log('browser', `launched (pid=${browserProc.pid}, cdp=:${debugPort})`);
 

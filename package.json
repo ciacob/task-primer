@@ -13,6 +13,19 @@
   },
   "taskPrimer": {
     "appName": "Task Primer",
+
+    "window": {
+      "width":  null,
+      "height": null,
+      "x":      null,
+      "y":      null
+    },
+
+    "security": {
+      "devTools":       true,
+      "allowNewWindows": true,
+      "allowRefresh":    true
+    },
     "browser": {
       "product":  "chrome",
       "buildId":  "stable",

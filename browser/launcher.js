@@ -82,21 +82,48 @@ const {
 /**
  * Build the Chromium launch argument list.
  *
- * --app=<url>              Frameless app window — no address bar, no tab strip.
- * --no-first-run           Skip first-launch setup prompts.
- * --no-default-browser-check  No "make Chrome your default" prompt.
- * --disable-extensions     No extension UI.
- * --disable-translate      No translation bar.
- * --disable-infobars       Suppresses the "Chrome for Testing" notification bar.
- * --remote-debugging-port  Enables CDP so we can detect window close reliably.
+ * Fixed flags (always applied):
+ *   --app=<url>              Frameless app window — no address bar, no tab strip.
+ *   --no-first-run           Skip first-launch setup prompts.
+ *   --no-default-browser-check  No "make Chrome your default" prompt.
+ *   --disable-extensions     No extension UI.
+ *   --disable-translate      No translation bar.
+ *   --disable-infobars       Suppresses the "Chrome for Testing" notification bar.
+ *   --remote-debugging-port  Enables CDP for window-close detection + guard injection.
+ *
+ * Configurable flags (driven by taskPrimer config in package.json):
+ *   --window-size=W,H        Initial window dimensions in CSS pixels.
+ *   --window-position=X,Y    Initial window position from top-left of primary screen.
+ *   --disable-dev-tools      Prevents F12 / right-click Inspect / Ctrl+Shift+I.
+ *                            Note: the CDP debug port remains open regardless; this
+ *                            only closes the in-window DevTools entry points.
+ *   --block-new-web-contents  Prevents the user from opening new tabs or windows
+ *                            via the browser menu, Cmd+T, Cmd+N, or keyboard
+ *                            shortcuts. Always applied — programmatic window.open()
+ *                            to the same origin is still allowed via the guard script
+ *                            when allowNewWindows is true.
  *
  * Linux: --no-sandbox added because most container/CI environments lack the
  * kernel namespace support Chrome's sandbox requires.
  *
  * @param {string} url
  * @param {number} debugPort
+ * @param {object} opts
+ * @param {number|null} opts.windowWidth
+ * @param {number|null} opts.windowHeight
+ * @param {number|null} opts.windowX
+ * @param {number|null} opts.windowY
+ * @param {boolean}     opts.devTools      default true
  */
-function buildLaunchArgs(url, debugPort) {
+function buildLaunchArgs(url, debugPort, opts = {}) {
+  const {
+    windowWidth  = null,
+    windowHeight = null,
+    windowX      = null,
+    windowY      = null,
+    devTools     = true,
+  } = opts;
+
   const args = [
     `--app=${url}`,
     '--no-first-run',
@@ -106,6 +133,28 @@ function buildLaunchArgs(url, debugPort) {
     '--disable-infobars',
     `--remote-debugging-port=${debugPort}`,
   ];
+
+  // Window geometry — only applied when both dimensions are provided.
+  // --window-size expects integers (CSS pixels); fractional values are truncated.
+  if (windowWidth != null && windowHeight != null) {
+    args.push(`--window-size=${Math.round(windowWidth)},${Math.round(windowHeight)}`);
+  }
+
+  // --window-position is best-effort: reliable on macOS and Windows, may be
+  // ignored by some Wayland compositors on Linux.
+  if (windowX != null && windowY != null) {
+    args.push(`--window-position=${Math.round(windowX)},${Math.round(windowY)}`);
+  }
+
+  // Block user-initiated new tabs/windows (browser menu, Cmd+T, Cmd+N, shortcuts).
+  // Does not affect programmatic window.open() — that is handled in the guard script.
+  args.push('--block-new-web-contents');
+
+  // Disable in-window DevTools entry points (F12, right-click Inspect, shortcuts).
+  // Does NOT close the remote CDP debug port — see taskPrimer.browser.debugPort.
+  if (!devTools) {
+    args.push('--disable-dev-tools');
+  }
 
   if (process.platform === 'linux') {
     args.push('--no-sandbox', '--disable-setuid-sandbox');
@@ -239,31 +288,46 @@ function renameAppBundle(executablePath, appName) {
 // ─── Navigation guard script ──────────────────────────────────────────────────
 
 /**
- * Injected into every new page target via Page.addScriptToEvaluateOnNewDocument.
+ * Returns a script string to inject via Page.addScriptToEvaluateOnNewDocument.
  *
- * Runs before any page script and locks the window to its origin so the user
- * cannot accidentally navigate away — e.g. by dropping a foreign URL onto the
- * app window, clicking a misconfigured link, or a form submitting elsewhere.
+ * The script runs before any page code and enforces three categories of
+ * restriction, each independently configurable:
  *
- * Same-origin navigation (hash changes, pushState, your own <a> tags) is
- * explicitly allowed so downstream developers do not have to think about this.
+ *   Navigation guard (always on):
+ *     Prevents the window from navigating away from the served origin.
+ *     Covers: location.href/assign/replace, <a> clicks, <form> submits,
+ *     and drag-and-drop of foreign URLs.
+ *     Same-origin navigation is always allowed.
  *
- * What is blocked:
- *   - window.location assignments to a foreign origin
- *   - window.location.assign() / replace() to a foreign origin
- *   - <a> clicks that would navigate to a foreign origin
- *   - <form> submissions targeting a foreign origin
- *   - drag-and-drop of foreign URLs onto the window
+ *   allowNewWindows (default: true):
+ *     Controls programmatic window.open() only. Browser menu / keyboard new-tab
+ *     and new-window shortcuts are always blocked via --block-new-web-contents.
+ *     true  → window.open() is allowed when the target URL is same-origin.
+ *             Foreign-origin window.open() calls are blocked regardless.
+ *     false → window.open() is blocked entirely, regardless of origin.
  *
- * All blocks are silent (no alert, no console noise by default) so the guard
- * is invisible during normal use. A single console.warn is emitted only when
- * a block actually fires, which is useful during development.
+ *   allowRefresh (default: true):
+ *     When false, intercepts Cmd/Ctrl+R and F5 keydown events in the capture
+ *     phase so the user cannot manually reload the page.
+ *     Note: this does not prevent programmatic location.reload() calls,
+ *     which downstream developers may need for legitimate purposes.
+ *
+ * Config values are baked into the script string at generation time so the
+ * injected code has no runtime dependency on any external state.
+ *
+ * @param {object} opts
+ * @param {boolean} opts.allowNewWindows  default true
+ * @param {boolean} opts.allowRefresh     default true
+ * @returns {string}
  */
-const NAVIGATION_GUARD_SCRIPT = `
+function buildGuardScript({ allowNewWindows = true, allowRefresh = true } = {}) {
+  return `
 (function () {
   'use strict';
 
-  const ALLOWED_ORIGIN = window.location.origin;
+  const ALLOWED_ORIGIN     = window.location.origin;
+  const ALLOW_NEW_WINDOWS  = ${allowNewWindows};
+  const ALLOW_REFRESH      = ${allowRefresh};
 
   function isForeignUrl(url) {
     if (!url) return false;
@@ -277,7 +341,7 @@ const NAVIGATION_GUARD_SCRIPT = `
   }
 
   function block(reason, url) {
-    console.warn('[task-primer] Navigation blocked (' + reason + '):', url);
+    console.warn('[task-primer] Blocked (' + reason + '):', url);
     return false;
   }
 
@@ -333,8 +397,7 @@ const NAVIGATION_GUARD_SCRIPT = `
 
   // ── <form> submit interception ──────────────────────────────────────────────
   document.addEventListener('submit', function (e) {
-    const form   = e.target;
-    const action = form.action || window.location.href;
+    const action = e.target.action || window.location.href;
     if (isForeignUrl(action)) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -357,13 +420,51 @@ const NAVIGATION_GUARD_SCRIPT = `
     if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
       e.preventDefault();
       e.stopImmediatePropagation();
-      const url = e.dataTransfer.getData('text/uri-list');
-      block('drag-and-drop', url);
+      block('drag-and-drop', e.dataTransfer.getData('text/uri-list'));
     }
   }, true);
 
+  // ── window.open override (allowNewWindows) ──────────────────────────────────
+  // Always overrides window.open to enforce origin policy:
+  //   allowNewWindows true  → same-origin calls pass through; foreign blocked.
+  //   allowNewWindows false → all calls blocked regardless of origin.
+  // Browser-menu / Cmd+T / Cmd+N new windows are already blocked by the
+  // --block-new-web-contents launch flag and never reach this code.
+  (function () {
+    const nativeOpen = window.open.bind(window);
+    window.open = function (url, target, features) {
+      if (!ALLOW_NEW_WINDOWS) {
+        block('window.open (disabled)', url);
+        return null;
+      }
+      // allowNewWindows true: allow same-origin, block foreign
+      if (url && isForeignUrl(url)) {
+        block('window.open (foreign origin)', url);
+        return null;
+      }
+      return nativeOpen(url, target, features);
+    };
+  })();
+
+  // ── Refresh interception (allowRefresh) ─────────────────────────────────────
+  // Blocks Cmd/Ctrl+R and F5 in the capture phase so they cannot reload the
+  // page. Does not affect programmatic location.reload() calls.
+  if (!ALLOW_REFRESH) {
+    document.addEventListener('keydown', function (e) {
+      const isReload = e.key === 'F5' ||
+                       ((e.metaKey || e.ctrlKey) && e.key === 'r') ||
+                       ((e.metaKey || e.ctrlKey) && e.key === 'R');
+      if (isReload) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        block('keyboard reload', e.key);
+      }
+    }, true);
+  }
+
 })();
 `;
+}
 
 // ─── CDP client ───────────────────────────────────────────────────────────────
 
@@ -420,7 +521,7 @@ function waitForCDP(port, retries = 20, delayMs = 200) {
  * @param {import('child_process').ChildProcess} childProc
  * @param {number} debugPort
  */
-async function attachCDP(childProc, debugPort, appUrl) {
+async function attachCDP(childProc, debugPort, appUrl, guardOpts) {
   let wsUrl;
   try {
     wsUrl = await waitForCDP(debugPort);
@@ -522,7 +623,7 @@ async function attachCDP(childProc, debugPort, appUrl) {
     // then reload — each step awaited so ordering is guaranteed.
     await pageSend('Page.enable', {});
     await pageSend('Page.addScriptToEvaluateOnNewDocument', {
-      source: NAVIGATION_GUARD_SCRIPT,
+      source: buildGuardScript(guardOpts),
     });
     await pageSend('Page.reload', { ignoreCache: false });
 
@@ -627,28 +728,54 @@ async function attachCDP(childProc, debugPort, appUrl) {
  * Ensure the browser is cached, rename the app bundle if needed, spawn, and
  * attach the CDP window-close detector.
  *
- * @param {object} options
- * @param {string} options.url        URL to open in the app window.
- * @param {string} options.cacheDir   Absolute path to the browser cache dir.
- * @param {string} options.buildId    Channel name or exact version (default: 'stable').
- * @param {string} [options.appName]  Desired macOS app name. Null to skip.
- * @param {number} [options.debugPort] CDP remote debugging port (default: 9222).
+ * @param {object}  options
+ * @param {string}  options.url             URL to open in the app window.
+ * @param {string}  options.cacheDir        Absolute path to the browser cache dir.
+ * @param {string}  options.buildId         Channel name or exact version (default: 'stable').
+ * @param {string}  [options.appName]       Desired macOS app name. Null to skip.
+ * @param {number}  [options.debugPort]     CDP remote debugging port (default: 9222).
+ * @param {number|null} [options.windowWidth]   Initial window width in CSS pixels.
+ * @param {number|null} [options.windowHeight]  Initial window height in CSS pixels.
+ * @param {number|null} [options.windowX]       Initial window X position.
+ * @param {number|null} [options.windowY]       Initial window Y position.
+ * @param {boolean} [options.devTools]      Allow DevTools access (default: true).
+ * @param {boolean} [options.allowNewWindows] Allow same-origin window.open() (default: true). Foreign-origin and browser-menu new windows are always blocked.
+ * @param {boolean} [options.allowRefresh]  Allow keyboard page reload (default: true).
  *
  * @returns {Promise<import('child_process').ChildProcess>}
  *   The spawned browser process. Listen to:
  *     .on('windowClosed', fn)  — user closed the app window (red button)
  *     .on('exit', fn)          — full process termination (Cmd+Q, kill)
  */
-async function launch({ url, cacheDir, buildId = 'stable', appName, debugPort = 9222 }) {
+async function launch({
+  url,
+  cacheDir,
+  buildId         = 'stable',
+  appName         = null,
+  debugPort       = 9222,
+  windowWidth     = null,
+  windowHeight    = null,
+  windowX         = null,
+  windowY         = null,
+  devTools        = true,
+  allowNewWindows = true,
+  allowRefresh    = true,
+}) {
   const executablePath = await ensureChromium(cacheDir, buildId);
 
   renameAppBundle(executablePath, appName);
 
   console.log(`[browser] Launching Chrome for Testing → ${url}`);
 
-  const child = spawn(executablePath, buildLaunchArgs(url, debugPort), {
-    detached: false,    // Keep the browser as a child of this process
-    stdio:    'ignore', // Chrome for Testing is chatty; silence it
+  // Options forwarded to buildLaunchArgs (flag-based restrictions)
+  const launchOpts = { windowWidth, windowHeight, windowX, windowY, devTools };
+
+  // Options forwarded to buildGuardScript (JS-based restrictions injected via CDP)
+  const guardOpts  = { allowNewWindows, allowRefresh };
+
+  const child = spawn(executablePath, buildLaunchArgs(url, debugPort, launchOpts), {
+    detached: false,
+    stdio:    'ignore',
   });
 
   child.on('error', (err) => {
@@ -656,7 +783,7 @@ async function launch({ url, cacheDir, buildId = 'stable', appName, debugPort = 
   });
 
   // Attach CDP asynchronously — don't block the caller waiting for it
-  attachCDP(child, debugPort, url).catch((err) => {
+  attachCDP(child, debugPort, url, guardOpts).catch((err) => {
     console.warn(`[browser] CDP setup error (non-fatal): ${err.message}`);
   });
 
