@@ -2,6 +2,26 @@
 
 A resident Node.js application that delegates work to a managed subprocess and exposes control over it via REST API, WebSocket, and an optional browser UI. Intended as a **primer** — a clean, modular foundation to build real applications on top of.
 
+
+```mermaid
+%%{init: {"flowchart": {"defaultRenderer": "elk"}}}%%
+graph TD
+    main["<b>main.js</b><br/>orchestrator · IPC hub · port config"]
+
+    main -->|fork + IPC| worker["<b>worker-process.js</b><br/>TaskShell · state machine"]
+    main -->|fork + IPC| server["<b>server-process.js</b><br/>Fastify · REST · WebSocket · static"]
+    main -->|spawn + CDP| browser["<b>Chrome for Testing</b><br/>──app window · nav guard · lifecycle"]
+
+    worker -->|runs| task["<b>task module</b><br/>any CJS module<br/>start · pause · resume · abort"]
+    server -->|serves| ui["<b>ui/</b><br/>index.html · adapter.js · app.js"]
+    browser -->|loads| ui
+
+    client(["REST / curl / script"])
+    browser -->|HTTP + WebSocket| server
+    client -->|HTTP| server
+```
+
+
 ```
 main.js  (orchestrator)
 ├── worker/worker-process.js   fork — runs the task, owns the state machine
@@ -21,7 +41,7 @@ node main.js                        # headless — ports auto-picked on first ru
 node main.js --ui                   # + download Chrome once, open app window
 node main.js --ui --autoexit        # + exit when the window is closed
 node main.js --worker-crash=restart # restart worker on unexpected crash
-node pickPorts.js --override        # manually re-pick ports if there's a later clash
+node pickPorts.js --override        # manually re-pick ports if they clash
 ```
 
 ---
