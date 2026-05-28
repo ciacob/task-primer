@@ -101,27 +101,6 @@
     cmd('Resetting to idle…', () => adapter.reset())
   );
 
-  // ── Test button: exercises all window.open() cases ─────────────────────────
-  // Useful for verifying the allowNewWindows guard is working as configured.
-  // Remove or gate behind a dev flag in production builds.
-  const btnTestWindow = document.getElementById('btn-test-window');
-  if (btnTestWindow) {
-    btnTestWindow.addEventListener('click', () => {
-      // Case 1: same-origin — allowed when allowNewWindows: true
-      const sameOrigin = window.location.origin + '/';
-      const w1 = window.open(sameOrigin, '_blank');
-      logEntry('window.open same-origin → ' + (w1 ? 'opened' : 'blocked'));
-
-      // Case 2: foreign origin — always blocked
-      const w2 = window.open('https://example.com', '_blank');
-      logEntry('window.open foreign origin → ' + (w2 ? 'opened' : 'blocked'), w2 ? null : 'error');
-
-      // Case 3: no URL (about:blank equivalent) — same-origin, allowed when true
-      const w3 = window.open('', '_blank');
-      logEntry('window.open empty URL → ' + (w3 ? 'opened' : 'blocked'));
-    });
-  }
-
   // ─── Wire up adapter ───────────────────────────────────────────────────────
   adapter.onStateChange((state) => {
     // Decorate with log entries for notable events
