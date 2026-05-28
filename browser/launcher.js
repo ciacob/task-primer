@@ -94,14 +94,9 @@ const {
  * Configurable flags (driven by taskPrimer config in package.json):
  *   --window-size=W,H        Initial window dimensions in CSS pixels.
  *   --window-position=X,Y    Initial window position from top-left of primary screen.
- *   --disable-dev-tools      Prevents F12 / right-click Inspect / Ctrl+Shift+I.
- *                            Note: the CDP debug port remains open regardless; this
- *                            only closes the in-window DevTools entry points.
- *   --block-new-web-contents  Prevents the user from opening new tabs or windows
- *                            via the browser menu, Cmd+T, Cmd+N, or keyboard
- *                            shortcuts. Always applied — programmatic window.open()
- *                            to the same origin is still allowed via the guard script
- *                            when allowNewWindows is true.
+ *
+ * DevTools suppression and new-window blocking are handled via CDP target
+ * lifecycle management (Target.closeTarget) rather than flags.
  *
  * Linux: --no-sandbox added because most container/CI environments lack the
  * kernel namespace support Chrome's sandbox requires.
@@ -113,7 +108,6 @@ const {
  * @param {number|null} opts.windowHeight
  * @param {number|null} opts.windowX
  * @param {number|null} opts.windowY
- * @param {boolean}     opts.devTools      default true
  */
 function buildLaunchArgs(url, debugPort, opts = {}) {
   const {
@@ -121,7 +115,6 @@ function buildLaunchArgs(url, debugPort, opts = {}) {
     windowHeight = null,
     windowX      = null,
     windowY      = null,
-    devTools     = true,
   } = opts;
 
   const args = [
@@ -144,16 +137,6 @@ function buildLaunchArgs(url, debugPort, opts = {}) {
   // ignored by some Wayland compositors on Linux.
   if (windowX != null && windowY != null) {
     args.push(`--window-position=${Math.round(windowX)},${Math.round(windowY)}`);
-  }
-
-  // Block user-initiated new tabs/windows (browser menu, Cmd+T, Cmd+N, shortcuts).
-  // Does not affect programmatic window.open() — that is handled in the guard script.
-  args.push('--block-new-web-contents');
-
-  // Disable in-window DevTools entry points (F12, right-click Inspect, shortcuts).
-  // Does NOT close the remote CDP debug port — see taskPrimer.browser.debugPort.
-  if (!devTools) {
-    args.push('--disable-dev-tools');
   }
 
   if (process.platform === 'linux') {
@@ -300,8 +283,9 @@ function renameAppBundle(executablePath, appName) {
  *     Same-origin navigation is always allowed.
  *
  *   allowNewWindows (default: true):
- *     Controls programmatic window.open() only. Browser menu / keyboard new-tab
- *     and new-window shortcuts are always blocked via --block-new-web-contents.
+ *     Controls programmatic window.open() only. New windows/tabs opened via the
+ *     browser UI or keyboard shortcuts are closed immediately via CDP regardless
+ *     of this setting (see attachCDP target lifecycle management).
  *     true  → window.open() is allowed when the target URL is same-origin.
  *             Foreign-origin window.open() calls are blocked regardless.
  *     false → window.open() is blocked entirely, regardless of origin.
@@ -332,11 +316,10 @@ function buildGuardScript({ allowNewWindows = true, allowRefresh = true } = {}) 
   function isForeignUrl(url) {
     if (!url) return false;
     try {
-      // Relative URLs are always same-origin — allow them
       const parsed = new URL(url, window.location.href);
       return parsed.origin !== ALLOWED_ORIGIN;
     } catch (_) {
-      return false; // Unparseable — allow and let the browser handle it
+      return false;
     }
   }
 
@@ -425,11 +408,10 @@ function buildGuardScript({ allowNewWindows = true, allowRefresh = true } = {}) 
   }, true);
 
   // ── window.open override (allowNewWindows) ──────────────────────────────────
-  // Always overrides window.open to enforce origin policy:
+  // First line of defence for programmatic new-window calls. CDP target closing
+  // is the backstop for anything that reaches the browser before this fires.
   //   allowNewWindows true  → same-origin calls pass through; foreign blocked.
   //   allowNewWindows false → all calls blocked regardless of origin.
-  // Browser-menu / Cmd+T / Cmd+N new windows are already blocked by the
-  // --block-new-web-contents launch flag and never reach this code.
   (function () {
     const nativeOpen = window.open.bind(window);
     window.open = function (url, target, features) {
@@ -521,7 +503,7 @@ function waitForCDP(port, retries = 20, delayMs = 200) {
  * @param {import('child_process').ChildProcess} childProc
  * @param {number} debugPort
  */
-async function attachCDP(childProc, debugPort, appUrl, guardOpts) {
+async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts) {
   let wsUrl;
   try {
     wsUrl = await waitForCDP(debugPort);
@@ -638,9 +620,48 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts) {
   const seenTargets = new Set();
 
   // The targetId of the page that loaded our app URL. We only emit
-  // 'windowClosed' when THIS target is destroyed, not DevTools or other
-  // auxiliary targets Chrome may open.
+  // 'windowClosed' when THIS target is destroyed.
   let appTargetId = null;
+
+  const { devTools = true, allowNewWindows = true } = lifeCycleOpts || {};
+  const appOrigin = new URL(appUrl).origin;
+
+  // Decide whether a newly created target should be kept or closed immediately.
+  // Returns a string reason if it should be closed, null if it should be kept.
+  function shouldClose(type, url) {
+    // DevTools targets — close when devTools is false
+    if (url && url.startsWith('devtools://')) {
+      return devTools ? null : 'DevTools suppressed (security.devTools: false)';
+    }
+
+    // Non-page targets (service workers, shared workers, etc.) — never close
+    if (type !== 'page') return null;
+
+    // Unparseable or blank URL — could be a transient about:blank before
+    // navigation. Close it; legitimate same-origin popups will have the
+    // actual URL set at targetCreated time.
+    let targetOrigin;
+    try {
+      const parsed = new URL(url);
+      // about:blank has origin 'null' as a string — treat as foreign
+      targetOrigin = (parsed.origin === 'null' || !parsed.origin) ? null : parsed.origin;
+    } catch (_) {
+      targetOrigin = null;
+    }
+
+    if (!targetOrigin) {
+      return 'blank or unparseable URL';
+    }
+
+    if (targetOrigin === appOrigin) {
+      // Same-origin page target
+      if (!allowNewWindows) return 'new windows disabled (security.allowNewWindows: false)';
+      return null; // Allowed
+    }
+
+    // Foreign-origin page target — always close
+    return 'foreign origin (' + targetOrigin + ')';
+  }
 
   browserWs.on('message', (data) => {
     let msg;
@@ -658,29 +679,37 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts) {
     // targets immediately — so this handles both existing and future pages.
     if (msg.method === 'Target.targetCreated') {
       const { targetId, type, url } = msg.params.targetInfo;
-      if (type !== 'page') return;
       if (seenTargets.has(targetId)) return;
       seenTargets.add(targetId);
 
-      // Identify our app target by URL origin. The first page target whose
-      // URL starts with our served origin is the app window. DevTools pages
-      // use chrome-devtools:// URLs and are never mistaken for the app.
-      if (!appTargetId) {
+      // Identify our app target — the first page at our origin
+      if (!appTargetId && type === 'page') {
         try {
-          const targetOrigin = new URL(url).origin;
-          const appOrigin    = new URL(appUrl).origin;
-          if (targetOrigin === appOrigin) {
+          if (new URL(url).origin === appOrigin) {
             appTargetId = targetId;
             console.log('[browser] CDP: identified app target', targetId);
           }
-        } catch (_) {
-          // Unparseable URL (e.g. about:blank during init) — not our target
-        }
+        } catch (_) {}
       }
 
-      installGuard(targetId).catch(err => {
-        console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
-      });
+      // Lifecycle management: close targets we don't want
+      const closeReason = shouldClose(type, url);
+      if (closeReason) {
+        console.log('[browser] CDP: closing target — ' + closeReason);
+        browserWs.send(JSON.stringify({
+          id:     browserMsgId++,
+          method: 'Target.closeTarget',
+          params: { targetId },
+        }));
+        return;
+      }
+
+      // Allowed page target — install navigation guard
+      if (type === 'page') {
+        installGuard(targetId).catch(err => {
+          console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
+        });
+      }
       return;
     }
 
@@ -738,8 +767,8 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts) {
  * @param {number|null} [options.windowHeight]  Initial window height in CSS pixels.
  * @param {number|null} [options.windowX]       Initial window X position.
  * @param {number|null} [options.windowY]       Initial window Y position.
- * @param {boolean} [options.devTools]      Allow DevTools access (default: true).
- * @param {boolean} [options.allowNewWindows] Allow same-origin window.open() (default: true). Foreign-origin and browser-menu new windows are always blocked.
+ * @param {boolean} [options.devTools]      Allow DevTools (default: true). When false, DevTools targets are closed immediately via CDP.
+ * @param {boolean} [options.allowNewWindows] Allow same-origin window.open() (default: true). Foreign-origin windows always closed. When false, all new windows closed.
  * @param {boolean} [options.allowRefresh]  Allow keyboard page reload (default: true).
  *
  * @returns {Promise<import('child_process').ChildProcess>}
@@ -767,11 +796,14 @@ async function launch({
 
   console.log(`[browser] Launching Chrome for Testing → ${url}`);
 
-  // Options forwarded to buildLaunchArgs (flag-based restrictions)
-  const launchOpts = { windowWidth, windowHeight, windowX, windowY, devTools };
+  // Options forwarded to buildLaunchArgs (flag-based, window geometry only)
+  const launchOpts    = { windowWidth, windowHeight, windowX, windowY };
 
-  // Options forwarded to buildGuardScript (JS-based restrictions injected via CDP)
-  const guardOpts  = { allowNewWindows, allowRefresh };
+  // Options forwarded to buildGuardScript (injected JS restrictions)
+  const guardOpts     = { allowNewWindows, allowRefresh };
+
+  // Options forwarded to attachCDP for target lifecycle management
+  const lifeCycleOpts = { devTools, allowNewWindows };
 
   const child = spawn(executablePath, buildLaunchArgs(url, debugPort, launchOpts), {
     detached: false,
@@ -783,7 +815,7 @@ async function launch({
   });
 
   // Attach CDP asynchronously — don't block the caller waiting for it
-  attachCDP(child, debugPort, url, guardOpts).catch((err) => {
+  attachCDP(child, debugPort, url, guardOpts, lifeCycleOpts).catch((err) => {
     console.warn(`[browser] CDP setup error (non-fatal): ${err.message}`);
   });
 
