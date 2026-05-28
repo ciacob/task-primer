@@ -282,14 +282,6 @@ function renameAppBundle(executablePath, appName) {
  *     and drag-and-drop of foreign URLs.
  *     Same-origin navigation is always allowed.
  *
- *   allowNewWindows (default: true):
- *     Controls programmatic window.open() only. New windows/tabs opened via the
- *     browser UI or keyboard shortcuts are closed immediately via CDP regardless
- *     of this setting (see attachCDP target lifecycle management).
- *     true  → window.open() is allowed when the target URL is same-origin.
- *             Foreign-origin window.open() calls are blocked regardless.
- *     false → window.open() is blocked entirely, regardless of origin.
- *
  *   allowRefresh (default: true):
  *     When false, intercepts Cmd/Ctrl+R and F5 keydown events in the capture
  *     phase so the user cannot manually reload the page.
@@ -300,17 +292,15 @@ function renameAppBundle(executablePath, appName) {
  * injected code has no runtime dependency on any external state.
  *
  * @param {object} opts
- * @param {boolean} opts.allowNewWindows  default true
  * @param {boolean} opts.allowRefresh     default true
  * @returns {string}
  */
-function buildGuardScript({ allowNewWindows = true, allowRefresh = true } = {}) {
+function buildGuardScript({ allowRefresh = true } = {}) {
   return `
 (function () {
   'use strict';
 
   const ALLOWED_ORIGIN     = window.location.origin;
-  const ALLOW_NEW_WINDOWS  = ${allowNewWindows};
   const ALLOW_REFRESH      = ${allowRefresh};
 
   function isForeignUrl(url) {
@@ -407,26 +397,6 @@ function buildGuardScript({ allowNewWindows = true, allowRefresh = true } = {}) 
     }
   }, true);
 
-  // ── window.open override (allowNewWindows) ──────────────────────────────────
-  // First line of defence for programmatic new-window calls. CDP target closing
-  // is the backstop for anything that reaches the browser before this fires.
-  //   allowNewWindows true  → same-origin calls pass through; foreign blocked.
-  //   allowNewWindows false → all calls blocked regardless of origin.
-  (function () {
-    const nativeOpen = window.open.bind(window);
-    window.open = function (url, target, features) {
-      if (!ALLOW_NEW_WINDOWS) {
-        block('window.open (disabled)', url);
-        return null;
-      }
-      // allowNewWindows true: allow same-origin, block foreign
-      if (url && isForeignUrl(url)) {
-        block('window.open (foreign origin)', url);
-        return null;
-      }
-      return nativeOpen(url, target, features);
-    };
-  })();
 
   // ── Refresh interception (allowRefresh) ─────────────────────────────────────
   // Blocks Cmd/Ctrl+R and F5 in the capture phase so they cannot reload the
@@ -623,7 +593,7 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
   // 'windowClosed' when THIS target is destroyed.
   let appTargetId = null;
 
-  const { devTools = true, allowNewWindows = true } = lifeCycleOpts || {};
+  const { devTools = true } = lifeCycleOpts || {};
   const appOrigin = new URL(appUrl).origin;
 
   // Decide whether a newly created target should be kept or closed immediately.
@@ -655,7 +625,6 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
 
     if (targetOrigin === appOrigin) {
       // Same-origin page target
-      if (!allowNewWindows) return 'new windows disabled (security.allowNewWindows: false)';
       return null; // Allowed
     }
 
@@ -768,7 +737,6 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
  * @param {number|null} [options.windowX]       Initial window X position.
  * @param {number|null} [options.windowY]       Initial window Y position.
  * @param {boolean} [options.devTools]      Allow DevTools (default: true). When false, DevTools targets are closed immediately via CDP.
- * @param {boolean} [options.allowNewWindows] Allow same-origin window.open() (default: true). Foreign-origin windows always closed. When false, all new windows closed.
  * @param {boolean} [options.allowRefresh]  Allow keyboard page reload (default: true).
  *
  * @returns {Promise<import('child_process').ChildProcess>}
@@ -787,7 +755,6 @@ async function launch({
   windowX         = null,
   windowY         = null,
   devTools        = true,
-  allowNewWindows = true,
   allowRefresh    = true,
 }) {
   const executablePath = await ensureChromium(cacheDir, buildId);
@@ -800,10 +767,10 @@ async function launch({
   const launchOpts    = { windowWidth, windowHeight, windowX, windowY };
 
   // Options forwarded to buildGuardScript (injected JS restrictions)
-  const guardOpts     = { allowNewWindows, allowRefresh };
+  const guardOpts     = { allowRefresh };
 
   // Options forwarded to attachCDP for target lifecycle management
-  const lifeCycleOpts = { devTools, allowNewWindows };
+  const lifeCycleOpts = { devTools };
 
   const child = spawn(executablePath, buildLaunchArgs(url, debugPort, launchOpts), {
     detached: false,

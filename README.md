@@ -1,29 +1,14 @@
 # task-primer
 
-A resident Node.js work-delegation application built as a **primer** — a clean,
-modular foundation onto which real applications can be layered.
+A resident Node.js application that delegates work to a managed subprocess and exposes control over it via REST API, WebSocket, and an optional browser UI. Intended as a **primer** — a clean, modular foundation to build real applications on top of.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                          main.js                             │
-│                (process orchestrator, IPC hub)               │
-│                                                              │
-│   ┌──────────────────┐      ┌─────────────────────────────┐  │
-│   │  worker-process  │      │       server-process        │  │
-│   │  ┌────────────┐  │ IPC  │   Fastify + WebSocket       │  │
-│   │  │ TaskShell  │  │◄────►│   REST  /worker/*           │  │
-│   │  │ (state     │  │      │   WS    /ws/status          │  │
-│   │  │  machine)  │  │      │   Static /  (UI)            │  │
-│   │  └─────┬──────┘  │      └─────────────┬───────────────┘  │
-│   │        │         │                    │                  │
-│   │  ┌─────▼──────┐  │                    │ WebSocket        │
-│   │  │ task module│  │                    ▼                  │
-│   │  │ (any CJS   │  │     ┌──────────────────────────────┐  │
-│   │  │  module)   │  │     │  Chrome for Testing --app    │  │
-│   │  └────────────┘  │     │  (our process, direct child) │  │
-│   └──────────────────┘     │  adapter.js + app.js         │  │
-│                            └──────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
+main.js  (orchestrator)
+├── worker/worker-process.js   fork — runs the task, owns the state machine
+├── server/server-process.js   fork — Fastify: REST + WebSocket + static UI
+└── Chrome for Testing         spawn — frameless --app window (--ui only)
+         ↕ IPC                          ↕ HTTP / WebSocket
+    TaskShell + task module        ui/adapter.js + ui/app.js
 ```
 
 ---
@@ -32,20 +17,10 @@ modular foundation onto which real applications can be layered.
 
 ```bash
 npm install
-
-node main.js                           # headless, port 3000
-node main.js --ui                      # download Chrome (once), open app window
-node main.js --ui --autoexit           # also exit when the window is closed
-node main.js --ui --port 8080          # custom port
-node main.js --worker-crash=restart    # auto-restart worker on crash
-```
-
-Or via npm scripts:
-
-```bash
-npm start             # headless
-npm run start:ui      # with browser window
-npm run start:dev     # browser + autoexit + auto-restart worker
+node main.js                        # headless — REST API on port 3000
+node main.js --ui                   # + download Chrome once, open app window
+node main.js --ui --autoexit        # + exit when the window is closed
+node main.js --worker-crash=restart # restart worker on unexpected crash
 ```
 
 ---
@@ -55,262 +30,156 @@ npm run start:dev     # browser + autoexit + auto-restart worker
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `3000` | Web server port |
-| `--host` | `127.0.0.1` | Web server bind address |
-| `--ui` | `false` | Download (once) and launch Chrome for Testing as an app window |
-| `--autoexit` | `false` | Exit the application when the browser window is closed. Requires `--ui` |
-| `--worker-crash` | `report` | `report` or `restart` — what to do if the worker process dies unexpectedly |
-
----
-
-## Browser window (`--ui`)
-
-The `--ui` flag does not open the user's default browser. Instead it downloads
-**Chrome for Testing** into `.browsers/` and launches it as a dedicated app
-window (`--app` mode — no address bar, no tabs). This has several deliberate
-consequences:
-
-- **The browser process is a direct child of `main.js`.** Its exit is detectable
-  via a normal Node.js `ChildProcess` `exit` event — no WebSocket heuristics
-  needed. This is what makes `--autoexit` reliable.
-- **The UI is always tested against a known engine.** No "works in my browser
-  but not yours" surface.
-- **The window feels like a native app,** not a browser tab.
-
-### First run
-
-On first `--ui` invocation the launcher resolves the current stable Chrome for
-Testing release and downloads it (~300 MB, one time):
-
-```
-[browser] Chrome for Testing 124.0.6367.207 not found in cache.
-[browser] Platform: mac-arm64
-[browser] Cache directory: /your/project/.browsers
-[browser] This is a one-time download (~300 MB). Please wait…
-[browser] Downloading… 5%  …  100%
-[browser] Download complete.
-[browser] Launching Chrome for Testing → http://127.0.0.1:3000
-```
-
-Subsequent runs skip straight to the launch line. The cache lives in `.browsers/`
-(git-ignored) in the project root.
-
-### Browser configuration
-
-All browser-related settings live in `package.json` under `taskPrimer`:
-
-```json
-"taskPrimer": {
-  "appName": "Task Primer",
-  "browser": {
-    "product":   "chrome",
-    "buildId":   "stable",
-    "cacheDir":  ".browsers",
-    "debugPort": 9222
-  }
-}
-```
-
-**`appName`** — the name shown in the macOS Dock, menu bar (the bold app name
-at the far left), and Mission Control. On first launch after download, the
-launcher patches `CFBundleName` and `CFBundleDisplayName` in the `.app` bundle's
-`Info.plist` using macOS's built-in `plutil` tool, then calls `lsregister -f`
-to flush the Launch Services cache so the Dock picks up the new name immediately.
-A sentinel file next to the plist records the last-applied name so the patch
-runs only once — or again if the name is changed in `package.json`. Has no
-effect on Linux or Windows. Set to `null` or omit to skip renaming entirely.
-
-> **Note:** the macOS menu bar *entries* (File, Edit, View, …) are controlled
-> by Chrome's internals and cannot be customised via plist or flags. Only the
-> app name — the bold item at the far left of the menu bar — is affected.
-
-**`debugPort`** — the port Chrome's remote debugging (CDP) endpoint listens on.
-The launcher attaches a lightweight CDP client on this port to detect when the
-user closes the app window via the red button — a signal that does not reliably
-produce a process `exit` event on macOS. Change this if port `9222` conflicts
-with other tooling (e.g. another Chrome instance or a debugger).
-The CDP client emits a `windowClosed` event on the browser process handle;
-`main.js` listens to both `windowClosed` and `exit` for full coverage.
-
-**`buildId: "stable"`** is a channel name, not a revision number. At download
-time, `@puppeteer/browsers` resolves it to the latest Chrome for Testing stable
-release that has confirmed downloads for all platforms (`linux64`, `mac-arm64`,
-`mac-x64`, `win32`, `win64`). The resolved binary is then cached and reused —
-the network is only hit once.
-
-This is deliberately chosen over hardcoding a revision number because revision
-availability varies by platform: a revision that exists for `linux64` may
-simply 404 on `mac-arm64`. The stable channel endpoint is the only authoritative
-source of a version confirmed to be cross-platform.
-
-### Pinning to a specific version
-
-If reproducibility matters more than staying current, replace `"stable"` with
-an exact version string:
-
-```json
-"buildId": "124.0.6367.207"
-```
-
-Use only versions listed at https://googlechromelabs.github.io/chrome-for-testing/
-and verify the version shows HTTP 200 for your target platforms before committing.
-After changing the version, delete `.browsers/` to force a fresh download.
+| `--host` | `127.0.0.1` | Bind address |
+| `--ui` | `false` | Launch the browser UI |
+| `--autoexit` | `false` | Exit when the browser window closes (requires `--ui`) |
+| `--worker-crash` | `report` | `report` or `restart` on unexpected worker exit |
 
 ---
 
 ## REST API
 
-All endpoints are on `http://localhost:3000/worker/`.
+Base: `http://localhost:3000`
 
 | Method | Path | Body | Description |
 |--------|------|------|-------------|
-| `GET` | `/worker/status` | — | Current worker state snapshot |
-| `POST` | `/worker/assign` | `{ modulePath, config? }` | Assign and start a task |
-| `POST` | `/worker/pause` | — | Pause a running task |
-| `POST` | `/worker/resume` | — | Resume a paused task |
-| `POST` | `/worker/abort` | — | Abort the current task immediately |
-| `POST` | `/worker/reset` | — | Return to `idle` after a terminal state |
-| `GET` | `/health` | — | Server liveness check |
+| `GET`  | `/worker/status` | — | Worker state snapshot |
+| `POST` | `/worker/assign` | `{ modulePath, config? }` | Load and start a task |
+| `POST` | `/worker/pause`  | — | Pause running task |
+| `POST` | `/worker/resume` | — | Resume paused task |
+| `POST` | `/worker/abort`  | — | Abort immediately |
+| `POST` | `/worker/reset`  | — | Return to `idle` after terminal state |
+| `GET`  | `/config`        | — | Public app config (appName, etc.) |
+| `GET`  | `/health`        | — | Liveness check |
 
-### Worker state shape
+Worker state shape:
 
 ```json
-{
-  "state":   "idle | running | paused | done | aborted | error",
-  "message": "human-readable status string or null",
-  "percent": 0-100 or null
-}
+{ "state": "idle|running|paused|done|aborted|error", "message": "…", "percent": 0 }
 ```
 
-### Example: assign the bundled task
-
-```bash
-curl -X POST http://localhost:3000/worker/assign \
-  -H "Content-Type: application/json" \
-  -d '{"modulePath": "worker/example-task.js", "config": {"steps": 50}}'
-```
-
-### WebSocket live feed
-
-Connect to `ws://localhost:3000/ws/status` to receive every state change as a
-JSON push in real time — same shape as the REST status response.
+Live state updates are also pushed over WebSocket at `ws://localhost:3000/ws/status`.
 
 ---
 
 ## Writing a task module
 
-Any task module must export an object with a `start(context)` method.
-`pause`, `resume`, and `abort` are optional but recommended.
+A task is any CJS module that exports an object with a `start(context)` method. `pause`, `resume`, and `abort` are optional.
 
 ```js
-// my-task.js
 module.exports = {
   _paused: false,
 
   start(context) {
-    // context.config        — the config object passed in the assign call
-    // context.isCancelled() — returns true when abort has been requested
-    // context.progress(percent, message?) — report progress (0–100)
-    // context.done(result?)               — signal successful completion
-    // context.fail(error)                 — signal failure
+    // context.config           — passed from the /assign call
+    // context.isCancelled()    — true after abort is requested
+    // context.progress(pct, msg?)
+    // context.done(result?)
+    // context.fail(error)
 
     let i = 0;
-    const total = context.config.total ?? 100;
-
     const tick = () => {
       if (context.isCancelled()) return;
       if (this._paused) return void setTimeout(tick, 100);
-      i++;
-      context.progress(Math.round(i / total * 100), `step ${i}`);
-      if (i >= total) return context.done({ processed: total });
+      context.progress(++i, `step ${i}`);
+      if (i >= 100) return context.done();
       setTimeout(tick, 50);
     };
-
-    setTimeout(tick, 0);
+    tick();
   },
 
-  pause()  { this._paused = true;  },
+  pause()  { this._paused = true; },
   resume() { this._paused = false; },
-  abort()  { /* cancel any timers / streams / open handles here */ },
+  abort()  { /* clear timers, close streams */ },
 };
 ```
 
-Assign it via REST:
-
-```bash
-curl -X POST http://localhost:3000/worker/assign \
-  -H "Content-Type: application/json" \
-  -d '{"modulePath": "tasks/my-task.js", "config": {"total": 200}}'
-```
-
-`modulePath` is resolved relative to the project root.
+`modulePath` in the assign call is resolved relative to the project root.
 
 ---
 
-## Architecture & seams
+## package.json configuration
 
-Every boundary is an explicit, replaceable interface:
+All runtime configuration lives under `taskPrimer` in `package.json`. No config file is needed.
 
-| Seam | File(s) | Replace to… |
-|------|---------|-------------|
-| IPC message contract | `shared/messages.js` | Change transport (e.g. Redis pub/sub) |
-| Worker state machine | `worker/task-shell.js` | Add priorities, queuing, timeouts |
-| Worker IPC harness | `worker/worker-process.js` | Swap to worker_threads, cluster, etc. |
-| Task interface | any module matching the Task Shell interface | Plug in real work |
-| Web server | `server/server-process.js` | Swap Fastify for anything |
-| REST routes | `server/routes/worker.js` | Version the API, add auth, etc. |
-| WebSocket feed | `server/ws/status-feed.js` | Swap for SSE, socket.io, etc. |
-| UI transport | `ui/adapter.js` | Change API shape without touching UI |
-| UI rendering | `ui/app.js` + `ui/index.html` | Drop in React, Vue, Svelte, etc. |
-| Browser launcher | `browser/launcher.js` | Swap build, channel, or launch strategy |
+```json
+"taskPrimer": {
+  "appName": "Task Primer",
+
+  "browser": {
+    "buildId":   "stable",
+    "cacheDir":  ".browsers",
+    "debugPort": 9222
+  },
+
+  "window": {
+    "width": null, "height": null,
+    "x":     null, "y":      null
+  },
+
+  "security": {
+    "devTools":        true,
+    "allowRefresh":    true
+  }
+}
+```
+
+**`appName`** — window title and `<h1>` heading. On macOS also patches the `.app` bundle's `Info.plist` so the menu bar shows the correct name. The Dock name cannot be changed reliably on macOS without a system restart.
+
+**`browser.buildId`** — `"stable"` resolves to the current Chrome for Testing stable release at download time and caches it. To pin a version, use an exact string like `"124.0.6367.207"` — find verified cross-platform builds at https://googlechromelabs.github.io/chrome-for-testing/. Delete `.browsers/` to force a re-download after changing.
+
+**`browser.debugPort`** — Chrome's CDP port. Used internally for window-close detection and navigation guard injection. Change if 9222 conflicts with other tooling.
+
+**`window`** — initial window geometry in CSS pixels. `null` means Chrome decides (remembers last position/size). `x`/`y` positioning is reliable on macOS and Windows; may be ignored by some Linux Wayland compositors.
+
+**`security`** — all default to `true` (dev-friendly). Set to `false` for production:
+
+- `devTools` — when `false`, DevTools windows are closed immediately via CDP as they open.
+- `allowRefresh` — when `false`, Cmd/Ctrl+R and F5 are suppressed in the page.
+
+> **Secondary windows are not supported.** The CDP target lifecycle manager closes any window that is not the main app target — including those opened via `window.open()` — because Chrome creates new targets with `about:blank` before navigating, and there is no reliable hook to distinguish a legitimate popup from an unwanted one at that moment. For UI that needs secondary "windows", use floating overlay panels within the single app window (`position: fixed`, or a library like `floating-ui`).
 
 ---
 
-## Project structure
+## Browser window details
 
-```
-task-primer/
-├── main.js                    # Entry point — orchestrates all child processes
-├── package.json               # taskPrimer.browser holds the browser build config
-├── .gitignore                 # Excludes node_modules/ and .browsers/
-├── shared/
-│   └── messages.js            # IPC message type constants and envelope factory
-├── worker/
-│   ├── worker-process.js      # Child process entry — IPC harness
-│   ├── task-shell.js          # State machine + context injection
-│   └── example-task.js        # Sample task (configurable-step counter)
-├── server/
-│   ├── server-process.js      # Child process entry — Fastify web server
-│   ├── routes/
-│   │   └── worker.js          # REST route handlers
-│   └── ws/
-│       └── status-feed.js     # WebSocket broadcast plugin
-├── browser/
-│   └── launcher.js            # Chrome for Testing: resolve, download, cache, spawn
-└── ui/
-    ├── index.html             # Minimal control UI
-    ├── adapter.js             # UIAdapter — all comms facade
-    └── app.js                 # Rendering layer (calls adapter only)
-```
+`--ui` downloads Chrome for Testing (~300 MB, once) into `.browsers/` and spawns it with `--app=<url>`, giving a frameless window with no address bar or tabs. The browser is a direct child process of `main.js`, so its exit is detectable without WebSocket heuristics — this is what makes `--autoexit` reliable.
+
+A CDP connection is maintained for:
+- Window-close detection (`targetDestroyed` → emit `windowClosed` on the child process)
+- Navigation guard injection (`Page.addScriptToEvaluateOnNewDocument`)
+- Target lifecycle management (closing DevTools, foreign-origin targets, etc.)
+
+The navigation guard, injected before any page code runs, blocks: `window.location` assignments to foreign origins, `<a>` clicks to foreign origins, `<form>` submissions to foreign origins, and drag-and-drop of foreign URLs onto the window. Same-origin navigation is never affected.
+
+---
+
+## Seams — what to replace and where
+
+| Seam | File | Replace to… |
+|------|------|-------------|
+| IPC message contract | `shared/messages.js` | Change transport or add message types |
+| Worker state machine | `worker/task-shell.js` | Add queuing, retries, timeouts |
+| Worker IPC harness | `worker/worker-process.js` | Swap to `worker_threads`, cluster |
+| Task implementation | any module matching the interface | Your real work |
+| Web server | `server/server-process.js` | Swap Fastify |
+| REST routes | `server/routes/worker.js` | Add auth, versioning |
+| WebSocket feed | `server/ws/status-feed.js` | Swap for SSE, socket.io |
+| UI transport | `ui/adapter.js` | Change without touching rendering |
+| UI rendering | `ui/app.js` + `ui/index.html` | React, Vue, Svelte, anything |
+| Browser launcher | `browser/launcher.js` | Electron, system browser, headless |
 
 ---
 
 ## pkg compatibility
 
-The project uses only CJS (`require`/`module.exports`) throughout. Three areas
-require attention when bundling with `pkg`:
+The project is CJS throughout. Three things need attention when bundling with `pkg`:
 
-**Task modules** — loaded via a runtime-computed `require(modulePath)` in
-`task-shell.js`. pkg cannot trace these statically; ship them as external files
-alongside the binary or load from a known asset path configured at build time.
+**Task modules** are loaded via a runtime-computed path and cannot be statically traced. Ship them as external files alongside the binary.
 
-**Chrome for Testing binary** — lives in `.browsers/` on disk, entirely outside
-any bundle. When packaging, point `cacheDir` to a path relative to the
-executable so the cache sits next to the distributed binary:
-
+**Chrome for Testing binary** lives in `.browsers/` outside any bundle. When packaging, redirect `cacheDir` to sit next to the executable:
 ```js
-// Suggested override in main.js when running under pkg:
 const cacheDir = path.resolve(path.dirname(process.execPath), '.browsers');
 ```
 
-**Static UI assets** — mark `ui/` as an asset directory in your `pkg`
-configuration so `@fastify/static` can serve the files at runtime.
+**Static UI assets** — declare `ui/` as a `pkg` asset directory so `@fastify/static` can find the files at runtime.

@@ -23,7 +23,6 @@
 
     "security": {
       "devTools":       true,
-      "allowNewWindows": true,
       "allowRefresh":    true
     },
     "browser": {

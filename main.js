@@ -242,14 +242,13 @@ async function launchBrowser() {
 
   // Security defaults are dev-friendly (everything allowed)
   const devTools        = securityCfg.devTools        !== false;
-  const allowNewWindows = securityCfg.allowNewWindows !== false;
   const allowRefresh    = securityCfg.allowRefresh    !== false;
 
   try {
     browserProc = await launch({
       url: SERVER_URL, cacheDir, buildId, appName, debugPort,
       windowWidth, windowHeight, windowX, windowY,
-      devTools, allowNewWindows, allowRefresh,
+      devTools, allowRefresh,
     });
 
     log('browser', `launched (pid=${browserProc.pid}, cdp=:${debugPort})`);
