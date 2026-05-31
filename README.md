@@ -130,7 +130,8 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
   "browser": {
     "buildId":   "stable",
     "cacheDir":  ".browsers",
-    "debugPort": 8120
+    "debugPort": 8120,
+    "autoUpdate": false
   },
 
   "window": {
@@ -150,6 +151,8 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
 **`webHost`** — the bind address for the web server. Defaults to `127.0.0.1` (loopback only). Change to `0.0.0.0` to accept connections from other machines on the network.
 
 **`browser.debugPort`** — Chrome's CDP remote debugging port, used internally for window-close detection, navigation guard injection, and target lifecycle management. Also `null` initially, auto-picked alongside `webPort` on first launch.
+
+**`browser.autoUpdate`** — when `false` (default), the launcher uses whatever Chrome for Testing build is already in `.browsers/` and never contacts the network after the initial download. When `true`, it resolves the `buildId` channel on every launch and downloads a newer build if one is available. To update manually with `autoUpdate: false`, delete `.browsers/` — the next launch will re-download.
 
 **`appName`** — window title and `<h1>` heading. On macOS also patches the `.app` bundle's `Info.plist` so the menu bar shows the correct name. The Dock name cannot be changed reliably on macOS without a system restart.
 

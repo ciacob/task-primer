@@ -149,14 +149,61 @@ function buildLaunchArgs(url, debugPort, opts = {}) {
 // ─── Download ─────────────────────────────────────────────────────────────────
 
 /**
- * Ensure the requested Chrome for Testing build is present in cacheDir.
- * Downloads if missing; skips silently if already cached.
+ * Find any existing Chrome for Testing executable in cacheDir, regardless of
+ * version. Used when autoUpdate is false — we use whatever is already cached
+ * rather than resolving the channel and potentially triggering a new download.
  *
- * @param {string} cacheDir   Absolute path to the cache directory.
- * @param {string} buildId    Channel name ('stable') or exact version string.
- * @returns {Promise<string>} Absolute path to the browser executable.
+ * Returns the executable path if a build is found, null otherwise.
+ *
+ * Cache layout: <cacheDir>/chrome/<platform>-<buildId>/chrome-<platform>/...
+ *
+ * @param {string} cacheDir
+ * @param {string} platform
+ * @returns {string|null}
  */
-async function ensureChromium(cacheDir, buildId) {
+function findAnyCachedBuild(cacheDir, platform) {
+  const chromeDir = path.join(cacheDir, 'chrome');
+  if (!fs.existsSync(chromeDir)) return null;
+
+  // Each entry is a directory named "<platform>-<buildId>"
+  const entries = fs.readdirSync(chromeDir).filter((e) => {
+    return e.startsWith(platform + '-') &&
+           fs.statSync(path.join(chromeDir, e)).isDirectory();
+  });
+
+  if (entries.length === 0) return null;
+
+  // If multiple builds are cached, use the most recently modified one
+  entries.sort((a, b) => {
+    const ta = fs.statSync(path.join(chromeDir, a)).mtimeMs;
+    const tb = fs.statSync(path.join(chromeDir, b)).mtimeMs;
+    return tb - ta;
+  });
+
+  const buildId     = entries[0].slice(platform.length + 1); // strip "<platform>-"
+  const execPath    = computeExecutablePath({ cacheDir, browser: 'chrome', buildId });
+
+  return fs.existsSync(execPath) ? execPath : null;
+}
+
+/**
+ * Ensure the requested Chrome for Testing build is present in cacheDir.
+ *
+ * autoUpdate behaviour:
+ *   false (default) — if any build is already cached, use it without touching
+ *                     the network. Only downloads on a completely empty cache.
+ *                     The developer controls updates by deleting .browsers/ or
+ *                     temporarily setting autoUpdate: true.
+ *   true            — resolves the channel (e.g. 'stable') to the current
+ *                     release and downloads it if the resolved version is not
+ *                     already cached. Old builds are not deleted automatically.
+ *
+ * @param {string}  cacheDir
+ * @param {string}  buildId     Channel name ('stable') or exact version string.
+ * @param {boolean} autoUpdate  Whether to check for a newer version.
+ * @returns {Promise<string>}   Absolute path to the browser executable.
+ */
+async function ensureChromium(cacheDir, buildId, autoUpdate) {
   const platform = detectBrowserPlatform();
 
   if (!platform) {
@@ -166,8 +213,17 @@ async function ensureChromium(cacheDir, buildId) {
     );
   }
 
-  // Resolve channel names ('stable', 'beta', …) to concrete version strings.
-  // Exact version strings pass through unchanged.
+  // autoUpdate: false — use any cached build, skip network entirely
+  if (!autoUpdate) {
+    const cached = findAnyCachedBuild(cacheDir, platform);
+    if (cached) {
+      console.log('[browser] Using cached build (autoUpdate: false):', cached);
+      return cached;
+    }
+    // Cache is empty — fall through to download regardless of autoUpdate setting
+    console.log('[browser] No cached build found — downloading for the first time…');
+  }
+
   const resolvedBuildId = await resolveBuildId('chrome', platform, buildId);
 
   const executablePath = computeExecutablePath({
@@ -177,10 +233,9 @@ async function ensureChromium(cacheDir, buildId) {
   });
 
   if (fs.existsSync(executablePath)) {
-    return executablePath;  // Already cached — fast path, no network required
+    return executablePath;
   }
 
-  // ── First-time download ───────────────────────────────────────────────────
   console.log(`[browser] Chrome for Testing ${resolvedBuildId} not found in cache.`);
   console.log(`[browser] Platform: ${platform}`);
   console.log(`[browser] Cache directory: ${cacheDir}`);
@@ -218,8 +273,8 @@ async function ensureChromium(cacheDir, buildId) {
  * @param {string} appName         Desired application name.
  */
 function renameAppBundle(executablePath, appName) {
-  if (process.platform !== 'darwin') { return; }
-  if (!appName) { return; }
+  if (process.platform !== 'darwin') return;
+  if (!appName)                       return;
 
   // Binary is at <bundle>/Contents/MacOS/<name>
   // Two levels up lands in Contents/, where Info.plist lives.
@@ -236,15 +291,11 @@ function renameAppBundle(executablePath, appName) {
   // Skip if already patched with this exact name
   try {
     const last = fs.readFileSync(sentinelPath, 'utf8').trim();
-    if (last === appName) return;  // Already correct — nothing to do
-  } catch (_) {
-    // Sentinel absent or unreadable — proceed with patch
-  }
+    if (last === appName) return;
+  } catch (_) {}
 
   try {
-    // plutil is a macOS system utility — always present, no extra dependency.
-    // -replace <key> -string <value> <file> edits the plist in place.
-    const q = JSON.stringify(appName);   // shell-safe quoting for the value
+    const q = JSON.stringify(appName);
     execSync(`plutil -replace CFBundleName        -string ${q} "${plistPath}"`);
     execSync(`plutil -replace CFBundleDisplayName -string ${q} "${plistPath}"`);
 
@@ -257,12 +308,10 @@ function renameAppBundle(executablePath, appName) {
 
     execSync(`"${lsregister}" -f "${bundlePath}"`);
 
-    // Write sentinel so we don't re-patch on every launch
     fs.writeFileSync(sentinelPath, appName, 'utf8');
 
     console.log(`[browser] App bundle renamed to "${appName}" (Dock cache flushed).`);
   } catch (err) {
-    // Cosmetic failure — warn but don't abort the launch
     console.warn(`[browser] App rename failed (non-fatal): ${err.message}`);
   }
 }
@@ -318,9 +367,7 @@ function buildGuardScript({ allowRefresh = true } = {}) {
     return false;
   }
 
-  // ── window.location property overrides ─────────────────────────────────────
-  // We shadow the native location object with a Proxy so assignments to
-  // .href and calls to .assign/.replace are intercepted.
+  // ── window.location overrides (navigation guard) ────────────────────────────
   const nativeLocation = window.location;
   const locationProxy  = new Proxy(nativeLocation, {
     set(target, prop, value) {
@@ -349,13 +396,8 @@ function buildGuardScript({ allowRefresh = true } = {}) {
   });
 
   try {
-    Object.defineProperty(window, 'location', {
-      get: () => locationProxy,
-      configurable: false,
-    });
-  } catch (_) {
-    // Some environments (e.g. sandboxed iframes) disallow this — skip silently
-  }
+    Object.defineProperty(window, 'location', { get: () => locationProxy, configurable: false });
+  } catch (_) {}
 
   // ── <a> click interception ──────────────────────────────────────────────────
   document.addEventListener('click', function (e) {
@@ -366,7 +408,7 @@ function buildGuardScript({ allowRefresh = true } = {}) {
       e.stopImmediatePropagation();
       block('anchor click', anchor.href);
     }
-  }, true); // capture phase — runs before any app listener
+  }, true);
 
   // ── <form> submit interception ──────────────────────────────────────────────
   document.addEventListener('submit', function (e) {
@@ -379,9 +421,6 @@ function buildGuardScript({ allowRefresh = true } = {}) {
   }, true);
 
   // ── Drag-and-drop interception ──────────────────────────────────────────────
-  // A URL dragged from another window and dropped on the app would normally
-  // trigger a navigation. We block the drop entirely; dragover must also be
-  // prevented otherwise the browser ignores the drop handler.
   document.addEventListener('dragover', function (e) {
     if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
       e.preventDefault();
@@ -644,8 +683,6 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
       return;
     }
 
-    // setDiscoverTargets causes Chrome to emit targetCreated for all existing
-    // targets immediately — so this handles both existing and future pages.
     if (msg.method === 'Target.targetCreated') {
       const { targetId, type, url } = msg.params.targetInfo;
       if (seenTargets.has(targetId)) return;
@@ -685,8 +722,7 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
     if (msg.method === 'Target.targetDestroyed') {
       const { targetId } = msg.params;
 
-      // Only shut down when the app window itself is destroyed, not when
-      // the user closes a DevTools panel or an auxiliary target exits.
+      // Only shut down when the app window itself is destroyed
       if (targetId !== appTargetId) return;
 
       console.log('[browser] CDP: app window closed.');
@@ -730,6 +766,7 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
  * @param {string}  options.url             URL to open in the app window.
  * @param {string}  options.cacheDir        Absolute path to the browser cache dir.
  * @param {string}  options.buildId         Channel name or exact version (default: 'stable').
+ * @param {boolean} [options.autoUpdate]    Re-download if a newer stable is available (default: false).
  * @param {string}  [options.appName]       Desired macOS app name. Null to skip.
  * @param {number}  [options.debugPort]     CDP remote debugging port (default: 9222).
  * @param {number|null} [options.windowWidth]   Initial window width in CSS pixels.
@@ -748,6 +785,7 @@ async function launch({
   url,
   cacheDir,
   buildId         = 'stable',
+  autoUpdate      = false,
   appName         = null,
   debugPort       = 9222,
   windowWidth     = null,
@@ -757,7 +795,7 @@ async function launch({
   devTools        = true,
   allowRefresh    = true,
 }) {
-  const executablePath = await ensureChromium(cacheDir, buildId);
+  const executablePath = await ensureChromium(cacheDir, buildId, autoUpdate);
 
   renameAppBundle(executablePath, appName);
 

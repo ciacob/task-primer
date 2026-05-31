@@ -225,6 +225,7 @@ async function launchBrowser() {
 
   const cacheDir       = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
   const buildId        = browserCfg.buildId  || 'stable';
+  const autoUpdate     = browserCfg.autoUpdate === true;  // explicit opt-in only
   const appName        = taskPrimerCfg.appName || null;
   const debugPort      = browserCfg.debugPort != null ? browserCfg.debugPort : 9222;
 
@@ -240,7 +241,7 @@ async function launchBrowser() {
 
   try {
     browserProc = await launch({
-      url: SERVER_URL, cacheDir, buildId, appName, debugPort,
+      url: SERVER_URL, cacheDir, buildId, autoUpdate, appName, debugPort,
       windowWidth, windowHeight, windowX, windowY,
       devTools, allowRefresh,
     });
