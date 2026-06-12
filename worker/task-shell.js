@@ -30,13 +30,24 @@ const TRANSITIONS = {
 
 class TaskShell {
   /**
-   * @param {Function} emit  — callback(messageEnvelope) to send events upward
+   * @param {Function} emit        — callback(messageEnvelope) to send events upward
+   * @param {object}  [uiDelegate] — object with sendToUI(message) and isNacre bool.
+   *                                 Injected by worker-process.js.
+   *                                 When absent, context.ui is a no-op stub.
    */
-  constructor(emit) {
-    this._emit      = emit;
-    this._state     = STATE.IDLE;
-    this._task      = null;
-    this._cancelled = false;
+  constructor(emit, uiDelegate = null) {
+    this._emit       = emit;
+    this._uiDelegate = uiDelegate;
+    this._state      = STATE.IDLE;
+    this._task       = null;
+    this._cancelled  = false;
+    // Registry of NOTIFY handlers set up via context.ui.on*()
+    this._uiHandlers = {
+      menuAction:   [],
+      fileOpen:     [],
+      appReopen:    [],
+      windowClosed: [],
+    };
   }
 
   get state() { return this._state; }
@@ -66,10 +77,126 @@ class TaskShell {
 
   // ─── Context object injected into tasks ────────────────────────────────────
 
+  /**
+   * Build the context.ui object exposed to task modules.
+   *
+   * In nacre mode (uiDelegate present and uiDelegate.isNacre === true):
+   *   setMenu / patchMenu / setDevTools → forwarded to main via IPC → nacre socket
+   *   on* handlers → called when NOTIFY messages arrive from main
+   *
+   * In CfT / npm mode (no uiDelegate, or uiDelegate.isNacre === false):
+   *   setMenu / patchMenu / setDevTools → log a no-op warning and return
+   *   on* handlers → registered but never called
+   */
+  _buildContextUI() {
+    const delegate = this._uiDelegate;
+    const isNacre  = delegate ? delegate.isNacre : false;
+    const handlers = this._uiHandlers;
+    const { UI_CMD } = require('../shared/messages');
+
+    function noOp(method) {
+      console.warn(`[task-shell] context.ui.${method}: no-op — not running in nacre mode`);
+    }
+
+    return {
+      /** Whether this app is running inside nacre (true) or CfT/npm (false). */
+      isNacre,
+
+      /**
+       * Replace the entire menu bar.
+       * @param {Array} menus  Array of MenuDescriptor objects.
+       */
+      setMenu(menus) {
+        if (!isNacre) { noOp('setMenu'); return; }
+        delegate.sendToUI({ type: UI_CMD.SET_MENU, menus });
+      },
+
+      /**
+       * Update specific menu items by id without rebuilding the whole bar.
+       * @param {Array} patches  Array of { id, label?, enabled?, checked? }.
+       */
+      patchMenu(patches) {
+        if (!isNacre) { noOp('patchMenu'); return; }
+        delegate.sendToUI({ type: UI_CMD.PATCH_MENU, patches });
+      },
+
+      /**
+       * Enable or disable the WebKit developer tools (Web Inspector).
+       * @param {boolean} enabled
+       */
+      setDevTools(enabled) {
+        if (!isNacre) { noOp('setDevTools'); return; }
+        delegate.sendToUI({ type: UI_CMD.SET_DEVTOOLS, enabled: Boolean(enabled) });
+      },
+
+      /**
+       * Register a handler called when the user activates a menu item.
+       * @param {Function} handler  fn(id: string) => void
+       */
+      onMenuAction(handler) {
+        handlers.menuAction.push(handler);
+      },
+
+      /**
+       * Register a handler called when macOS delivers file-open requests
+       * (registered UTIs, drag-to-Dock, Finder open-with).
+       * @param {Function} handler  fn(paths: string[]) => void
+       */
+      onFileOpen(handler) {
+        handlers.fileOpen.push(handler);
+      },
+
+      /**
+       * Register a handler called when the user clicks the Dock icon while
+       * the app is already running.
+       * @param {Function} handler  fn() => void
+       */
+      onAppReopen(handler) {
+        handlers.appReopen.push(handler);
+      },
+
+      /**
+       * Register a handler called when the app window is closed.
+       * Note: --autoexit in main.js already handles process shutdown;
+       * this is for tasks that need to do cleanup before exit.
+       * @param {Function} handler  fn() => void
+       */
+      onWindowClosed(handler) {
+        handlers.windowClosed.push(handler);
+      },
+    };
+  }
+
+  /**
+   * Called by worker-process.js when a NOTIFY message arrives from main.
+   * Dispatches to any handlers the current task registered via context.ui.on*().
+   * @param {object} envelope  IPC message envelope ({ type, payload? }).
+   */
+  dispatchNotify(envelope) {
+    const { NOTIFY } = require('../shared/messages');
+    switch (envelope.type) {
+      case NOTIFY.MENU_ACTION:
+        this._uiHandlers.menuAction.forEach((h) => h(envelope.payload?.id));
+        break;
+      case NOTIFY.FILE_OPEN:
+        this._uiHandlers.fileOpen.forEach((h) => h(envelope.payload?.paths));
+        break;
+      case NOTIFY.APP_REOPEN:
+        this._uiHandlers.appReopen.forEach((h) => h());
+        break;
+      case NOTIFY.WINDOW_CLOSED:
+        this._uiHandlers.windowClosed.forEach((h) => h());
+        break;
+      default:
+        break;
+    }
+  }
+
   _buildContext(taskConfig) {
     return {
-      config: taskConfig || {},
+      config:      taskConfig || {},
       isCancelled: () => this._cancelled,
+      ui:          this._buildContextUI(),
 
       progress: (percent, message) => {
         if (this._state !== STATE.RUNNING && this._state !== STATE.PAUSED) return;
@@ -126,6 +253,9 @@ class TaskShell {
 
     this._task      = taskModule;
     this._cancelled = false;
+
+    // Reset UI handlers so stale handlers from a previous task don't fire
+    this._uiHandlers = { menuAction: [], fileOpen: [], appReopen: [], windowClosed: [] };
 
     if (!this._transition(STATE.RUNNING)) return;
 

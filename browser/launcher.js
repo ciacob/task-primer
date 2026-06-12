@@ -882,7 +882,12 @@ async function launchNacre({
   sendToNacre({ type: 'set_devtools', enabled: devTools });
   sendToNacre({ type: 'set_script',   script: buildGuardScript({ allowRefresh }) });
 
-  // Handle inbound messages from nacre
+  // Build the NacreUI instance that owns this socket for outbound sends
+  // and delivers inbound events to main.js.
+  const { NacreUI } = require('./nacre-ui');
+  const ui = new NacreUI(sock);
+
+  // Handle inbound messages from nacre — route through NacreUI
   let buffer = '';
   sock.on('data', (chunk) => {
     buffer += chunk.toString();
@@ -895,11 +900,14 @@ async function launchNacre({
       let msg;
       try { msg = JSON.parse(trimmed); } catch (_) { continue; }
 
+      // Deliver to NacreUI (emits menuAction, fileOpen, appReopen, windowClosed)
+      ui._handleInbound(msg);
+
+      // Also emit windowClosed on the process handle so main.js --autoexit works
       if (msg.type === 'window_closed') {
         console.log('[browser] nacre: window closed');
         handle.emit('windowClosed');
       }
-      // menu_action, file_open, app_reopen — available for future use
     }
   });
 
@@ -911,9 +919,12 @@ async function launchNacre({
     console.log('[browser] nacre socket closed');
     // If the socket closes unexpectedly, treat it as a window close
     handle.emit('windowClosed');
+    ui.emit('windowClosed');
   });
 
-  return handle;
+  // Return both the process handle (for main.js lifecycle management)
+  // and the NacreUI instance (for UI driving and event observation).
+  return { handle, ui };
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────

@@ -33,7 +33,7 @@ const path        = require('path');
 const yargs       = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 
-const { CMD, EVT, SRV, STATE, msg } = require('./shared/messages');
+const { CMD, EVT, SRV, UI_CMD, STATE, msg } = require('./shared/messages');
 
 // ─── CLI arguments ────────────────────────────────────────────────────────────
 
@@ -82,6 +82,7 @@ let workerState = {
 let workerProc  = null;
 let serverProc  = null;
 let browserProc = null;   // Only set when --ui is active
+let nacreUI     = null;   // NacreUI instance (nacre mode) or NacreUIStub (CfT/npm mode)
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -114,6 +115,15 @@ function spawnWorker() {
       case EVT.READY:
         log('worker', 'ready');
         updateState({ state: STATE.IDLE, message: 'Worker ready' });
+        // Inform the worker whether we are in nacre mode so context.ui.isNacre
+        // is accurate before the first task is assigned. nacreUI is set during
+        // launchBrowser(); if --ui was not passed it stays null (not nacre).
+        if (workerProc && workerProc.connected) {
+          workerProc.send({
+            type:    'WORKER_SET_IS_NACRE',
+            payload: { isNacre: nacreUI ? nacreUI.isNacre : false },
+          });
+        }
         break;
 
       case EVT.STATUS_UPDATE:
@@ -140,6 +150,24 @@ function spawnWorker() {
         log('worker', 'ERROR:', envelope.payload?.message);
         if (envelope.payload?.stack) log('worker', envelope.payload.stack);
         updateState({ state: STATE.ERROR, message: envelope.payload?.message });
+        break;
+
+      // ── UI commands from worker (worker → main → nacre) ──────────────────
+      // These arrive when task modules call context.ui.setMenu() etc.
+      // nacreUI is always set by the time the worker is running:
+      //   nacre mode → real NacreUI wrapping the socket
+      //   CfT mode   → NacreUIStub that logs a no-op warning
+
+      case UI_CMD.SET_MENU:
+        if (nacreUI) nacreUI.setMenu(envelope.payload?.menus);
+        break;
+
+      case UI_CMD.PATCH_MENU:
+        if (nacreUI) nacreUI.patchMenu(envelope.payload?.patches);
+        break;
+
+      case UI_CMD.SET_DEVTOOLS:
+        if (nacreUI) nacreUI.setDevTools(envelope.payload?.enabled);
         break;
 
       default:
@@ -213,7 +241,9 @@ function spawnServer() {
 // ─── Browser launch (--ui) ────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  const { launch, launchNacre } = require('./browser/launcher');
+  const { launch, launchNacre }       = require('./browser/launcher');
+  const { NacreUIStub }               = require('./browser/nacre-ui');
+  const { UI_CMD, NOTIFY }            = require('./shared/messages');
 
   // Read config from package.json (taskPrimer.*) so all browser options
   // are configurable without touching code. cacheDir is resolved relative
@@ -250,13 +280,38 @@ async function launchBrowser() {
     }
 
     try {
-      browserProc = await launchNacre({
+      const result = await launchNacre({
         url: SERVER_URL, appName, appBundleId,
         windowWidth, windowHeight, windowX, windowY,
         devTools, allowRefresh,
       });
 
+      browserProc = result.handle;
+      nacreUI     = result.ui;
+
       log('browser', `nacre launched (pid=${browserProc.pid})`);
+
+      // Forward nacre UI events to the worker as NOTIFY messages so task
+      // modules can observe them via context.ui.on*() handlers.
+      nacreUI.on('menuAction', (id) => {
+        log('browser', `menu_action: "${id}"`);
+        if (workerProc && workerProc.connected) {
+          workerProc.send(msg(NOTIFY.MENU_ACTION, { id }));
+        }
+      });
+      nacreUI.on('fileOpen', (paths) => {
+        log('browser', `file_open: ${JSON.stringify(paths)}`);
+        if (workerProc && workerProc.connected) {
+          workerProc.send(msg(NOTIFY.FILE_OPEN, { paths }));
+        }
+      });
+      nacreUI.on('appReopen', () => {
+        log('browser', 'app_reopen');
+        if (workerProc && workerProc.connected) {
+          workerProc.send(msg(NOTIFY.APP_REOPEN));
+        }
+      });
+
     } catch (err) {
       log('browser', `nacre launch failed: ${err.message}`);
       log('browser', `open manually: ${SERVER_URL}`);
@@ -265,6 +320,9 @@ async function launchBrowser() {
 
   // ── Chrome for Testing path (unchanged) ───────────────────────────────────
   } else {
+    // Use a no-op stub so UI_CMD messages from the worker are handled
+    // gracefully (logged as no-ops) even in CfT mode.
+    nacreUI = new NacreUIStub();
     const cacheDir  = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
     const buildId   = browserCfg.buildId   || 'stable';
     const autoUpdate = browserCfg.autoUpdate === true;

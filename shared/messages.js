@@ -33,6 +33,26 @@ const EVT = {
   TASK_PROGRESS:  'EVT_TASK_PROGRESS',  // payload: { percent, message? }
 };
 
+// ─── UI commands: worker → main ───────────────────────────────────────────────
+// Sent by task modules via context.ui.* to drive the native macOS UI.
+// main.js forwards these to the nacre socket.
+// In CfT / npm mode these are received by main but silently no-op'd.
+const UI_CMD = {
+  SET_MENU:     'UI_CMD_SET_MENU',     // payload: { menus: MenuDescriptor[] }
+  PATCH_MENU:   'UI_CMD_PATCH_MENU',   // payload: { patches: MenuPatch[] }
+  SET_DEVTOOLS: 'UI_CMD_SET_DEVTOOLS', // payload: { enabled: boolean }
+};
+
+// ─── UI notifications: main → worker ─────────────────────────────────────────
+// Sent by main.js when nacre emits native UI events.
+// worker-process.js delivers these to context.ui.on* handlers.
+// In CfT / npm mode these are never sent.
+const NOTIFY = {
+  MENU_ACTION: 'NOTIFY_MENU_ACTION',  // payload: { id: string }
+  FILE_OPEN:   'NOTIFY_FILE_OPEN',    // payload: { paths: string[] }
+  APP_REOPEN:  'NOTIFY_APP_REOPEN',   // payload: (none)
+};
+
 // ─── Internal: server-process ↔ main ─────────────────────────────────────────
 const SRV = {
   // server → main  (forwarded REST commands)
@@ -65,4 +85,4 @@ function msg(type, payload, id) {
   return envelope;
 }
 
-module.exports = { CMD, EVT, SRV, STATE, msg };
+module.exports = { CMD, EVT, UI_CMD, NOTIFY, SRV, STATE, msg };
