@@ -213,7 +213,7 @@ function spawnServer() {
 // ─── Browser launch (--ui) ────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  const { launch } = require('./browser/launcher');
+  const { launch, launchNacre } = require('./browser/launcher');
 
   // Read config from package.json (taskPrimer.*) so all browser options
   // are configurable without touching code. cacheDir is resolved relative
@@ -223,13 +223,7 @@ async function launchBrowser() {
   const windowCfg     = taskPrimerCfg.window    || {};
   const securityCfg   = taskPrimerCfg.security  || {};
 
-  const cacheDir       = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
-  const buildId        = browserCfg.buildId  || 'stable';
-  const autoUpdate     = browserCfg.autoUpdate === true;  // explicit opt-in only
-  const appName        = taskPrimerCfg.appName || null;
-  const debugPort      = browserCfg.debugPort != null ? browserCfg.debugPort : 9222;
-
-  // Window geometry — null means "let Chrome decide" (uses remembered size/position)
+  // Window geometry — null means "let the browser decide"
   const windowWidth    = windowCfg.width  != null ? windowCfg.width  : null;
   const windowHeight   = windowCfg.height != null ? windowCfg.height : null;
   const windowX        = windowCfg.x      != null ? windowCfg.x      : null;
@@ -239,45 +233,88 @@ async function launchBrowser() {
   const devTools        = securityCfg.devTools        !== false;
   const allowRefresh    = securityCfg.allowRefresh    !== false;
 
-  try {
-    browserProc = await launch({
-      url: SERVER_URL, cacheDir, buildId, autoUpdate, appName, debugPort,
-      windowWidth, windowHeight, windowX, windowY,
-      devTools, allowRefresh,
-    });
+  // ── nacre path ─────────────────────────────────────────────────────────────
+  // When browser.product === 'nacre', spawn the embedded nacre binary and
+  // drive it over the Unix socket protocol instead of CDP.
+  // launchNacre() returns a fake EventEmitter that is API-compatible with the
+  // ChildProcess returned by launch() below, so the rest of this function and
+  // all of main.js are unchanged.
 
-    log('browser', `launched (pid=${browserProc.pid}, cdp=:${debugPort})`);
+  if (browserCfg.product === 'nacre') {
+    const appName     = taskPrimerCfg.appName     || null;
+    const appBundleId = taskPrimerCfg.appBundleId || null;
 
-    // 'windowClosed' is emitted by the CDP client in launcher.js when the
-    // user closes the app window via the red button. This is the primary
-    // signal for --autoexit and fires before (or instead of) 'exit'.
-    browserProc.on('windowClosed', () => {
-      log('browser', 'window closed (CDP)');
-      if (argv.autoexit) {
-        log('main', '--autoexit: browser window closed, shutting down');
-        shutdown('browser-exit');
-      }
-    });
+    if (!appName || !appBundleId) {
+      log('browser', 'nacre path requires taskPrimer.appName and taskPrimer.appBundleId in package.json');
+      return;
+    }
 
-    // 'exit' fires on full process termination (Cmd+Q, kill signal).
-    // Guard with a flag so we don't double-shutdown if 'windowClosed' already ran.
-    let shuttingDown = false;
-    browserProc.on('exit', (code, signal) => {
-      log('browser', `process exited (code=${code}, signal=${signal})`);
-      if (argv.autoexit && !shuttingDown) {
-        shuttingDown = true;
-        log('main', '--autoexit: browser process exited, shutting down');
-        shutdown('browser-exit');
-      }
-    });
+    try {
+      browserProc = await launchNacre({
+        url: SERVER_URL, appName, appBundleId,
+        windowWidth, windowHeight, windowX, windowY,
+        devTools, allowRefresh,
+      });
 
-    // Set the flag when windowClosed fires so exit doesn't double-trigger
-    browserProc.on('windowClosed', () => { shuttingDown = true; });
+      log('browser', `nacre launched (pid=${browserProc.pid})`);
+    } catch (err) {
+      log('browser', `nacre launch failed: ${err.message}`);
+      log('browser', `open manually: ${SERVER_URL}`);
+      return;
+    }
 
-  } catch (err) {
-    log('browser', `launch failed: ${err.message}`);
-    log('browser', `open manually: ${SERVER_URL}`);
+  // ── Chrome for Testing path (unchanged) ───────────────────────────────────
+  } else {
+    const cacheDir  = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
+    const buildId   = browserCfg.buildId   || 'stable';
+    const autoUpdate = browserCfg.autoUpdate === true;
+    const appName   = taskPrimerCfg.appName || null;
+    const debugPort = browserCfg.debugPort != null ? browserCfg.debugPort : 9222;
+
+    try {
+      browserProc = await launch({
+        url: SERVER_URL, cacheDir, buildId, autoUpdate, appName, debugPort,
+        windowWidth, windowHeight, windowX, windowY,
+        devTools, allowRefresh,
+      });
+
+        log('browser', `launched (pid=${browserProc.pid}, cdp=:${debugPort})`);
+    } catch (err) {
+      log('browser', `launch failed: ${err.message}`);
+      log('browser', `open manually: ${SERVER_URL}`);
+      return;
+    }
   }
+
+  // ── Shared event wiring (nacre and CfT paths both land here) ──────────────
+  // browserProc is either a real ChildProcess (CfT) or a fake EventEmitter
+  // (nacre) — both expose .on('windowClosed') and .on('exit').
+
+  // 'windowClosed' is emitted by the CDP client in launcher.js when the
+  // user closes the app window via the red button. This is the primary
+  // signal for --autoexit and fires before (or instead of) 'exit'.
+  browserProc.on('windowClosed', () => {
+    log('browser', 'window closed');
+    if (argv.autoexit) {
+      log('main', '--autoexit: browser window closed, shutting down');
+      shutdown('browser-exit');
+    }
+  });
+
+  // 'exit' fires on full process termination (Cmd+Q, kill signal).
+  // Guard with a flag so we don't double-shutdown if 'windowClosed' already ran.
+  let shuttingDown = false;
+  browserProc.on('exit', (code, signal) => {
+    log('browser', `process exited (code=${code}, signal=${signal})`);
+    if (argv.autoexit && !shuttingDown) {
+      shuttingDown = true;
+      log('main', '--autoexit: browser process exited, shutting down');
+      shutdown('browser-exit');
+    }
+  });
+
+  // Set the flag when windowClosed fires so exit doesn't double-trigger
+  browserProc.on('windowClosed', () => { shuttingDown = true; });
 }
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
@@ -310,9 +347,15 @@ async function boot() {
   const pkgWeb = tp.webPort;
   const pkgDbg = tp.browser && tp.browser.debugPort;
 
-  // If either port is unset, run pickPorts.js — regardless of --ui.
-  // Port clashes are just as relevant in headless mode.
-  if (pkgWeb == null || pkgDbg == null) {
+  // In the nacre path there is no debugPort — only webPort needs to be set.
+  // In the CfT path both ports must be set.
+  const isNacrePath = tp.browser && tp.browser.product === 'nacre';
+  const portsReady  = isNacrePath ? pkgWeb != null : (pkgWeb != null && pkgDbg != null);
+
+  // If ports are not yet set, run pickPorts.js.
+  // In the nacre path this still writes a debugPort (harmlessly) because
+  // pickPorts.js always picks two ports. That is fine.
+  if (!portsReady) {
     log('main', 'ports not set — running pickPorts.js…');
     try {
       execFileSync(process.execPath, [path.join(__dirname, 'pickPorts.js')], {

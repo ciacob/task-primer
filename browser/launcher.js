@@ -3,7 +3,7 @@
 /**
  * browser/launcher.js
  *
- * Responsible for five things:
+ * Responsible for five things (Chrome for Testing path):
  *   1. Resolving the correct Chrome for Testing binary for the current platform
  *   2. Downloading it (once) if not already cached in <cacheDir>
  *   3. Renaming the .app bundle on macOS (once) so the Dock, menu bar, and
@@ -13,6 +13,21 @@
  *        a) emits a 'windowClosed' event when the user closes the browser window
  *        b) injects a navigation guard script into every new page target so the
  *           app window cannot be navigated away from the served origin
+ *
+ * ── nacre path ────────────────────────────────────────────────────────────────
+ *
+ *   When taskPrimer.browser.product === 'nacre', this module takes a different
+ *   path:
+ *     - Resolves the nacre binary at the conventional relative path from the
+ *       running executable (process.execPath).
+ *     - Spawns the nacre binary, passing --app=<url>, window geometry flags,
+ *       and --nacre-socket=<path> so nacre knows where to listen.
+ *     - Connects to the nacre Unix domain socket.
+ *     - Sends set_url, set_script, set_devtools, and optionally set_menu.
+ *     - Returns a fake EventEmitter that emits 'windowClosed' when nacre sends
+ *       the window_closed message, and 'exit' when the nacre process exits.
+ *       This fake handle is API-compatible with the ChildProcess returned by
+ *       the CfT path, so main.js requires zero changes.
  *
  * ── Window close detection via CDP ───────────────────────────────────────────
  *
@@ -65,17 +80,178 @@
  *   All bundle cleanly with pkg.
  */
 
+// ─── Pure helpers (no external dependencies) ─────────────────────────────────
+// These are extracted before the external requires so they can be tested
+// without node_modules installed.
+
+/**
+ * Build the Chromium / WKWebView navigation guard script.
+ * Used by both the CfT path (CDP injection) and the nacre path (set_script).
+ *
+ * @param {object}  opts
+ * @param {boolean} opts.allowRefresh  default true
+ * @returns {string}
+ */
+function buildGuardScript({ allowRefresh = true } = {}) {
+  return `
+(function () {
+  'use strict';
+
+  const ALLOWED_ORIGIN     = window.location.origin;
+  const ALLOW_REFRESH      = ${allowRefresh};
+
+  function isForeignUrl(url) {
+    if (!url) return false;
+    try {
+      const parsed = new URL(url, window.location.href);
+      return parsed.origin !== ALLOWED_ORIGIN;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function block(reason, url) {
+    console.warn('[task-primer] Blocked (' + reason + '):', url);
+    return false;
+  }
+
+  // ── window.location overrides (navigation guard) ────────────────────────────
+  const nativeLocation = window.location;
+  const locationProxy  = new Proxy(nativeLocation, {
+    set(target, prop, value) {
+      if (prop === 'href' && isForeignUrl(value)) {
+        return block('location.href', value);
+      }
+      target[prop] = value;
+      return true;
+    },
+    get(target, prop) {
+      if (prop === 'assign') {
+        return function (url) {
+          if (isForeignUrl(url)) { block('location.assign', url); return; }
+          target.assign(url);
+        };
+      }
+      if (prop === 'replace') {
+        return function (url) {
+          if (isForeignUrl(url)) { block('location.replace', url); return; }
+          target.replace(url);
+        };
+      }
+      const val = target[prop];
+      return typeof val === 'function' ? val.bind(target) : val;
+    },
+  });
+
+  try {
+    Object.defineProperty(window, 'location', { get: () => locationProxy, configurable: false });
+  } catch (_) {}
+
+  // ── <a> click interception ──────────────────────────────────────────────────
+  document.addEventListener('click', function (e) {
+    const anchor = e.target.closest('a[href]');
+    if (!anchor) return;
+    if (isForeignUrl(anchor.href)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      block('anchor click', anchor.href);
+    }
+  }, true);
+
+  // ── <form> submit interception ──────────────────────────────────────────────
+  document.addEventListener('submit', function (e) {
+    const action = e.target.action || window.location.href;
+    if (isForeignUrl(action)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      block('form submit', action);
+    }
+  }, true);
+
+  // ── Drag-and-drop interception ──────────────────────────────────────────────
+  document.addEventListener('dragover', function (e) {
+    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'none';
+    }
+  }, true);
+
+  document.addEventListener('drop', function (e) {
+    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
+      e.preventDefault();
+      block('drag-and-drop', e.dataTransfer.getData('text/uri-list'));
+    }
+  }, true);
+
+  // ── Refresh suppression ─────────────────────────────────────────────────────
+  if (!ALLOW_REFRESH) {
+    document.addEventListener('keydown', function (e) {
+      const isReload = (e.key === 'r' && (e.metaKey || e.ctrlKey)) || e.key === 'F5';
+      if (isReload) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        block('keyboard reload', e.key);
+      }
+    }, true);
+  }
+
+})();
+`;
+}
+
+/**
+ * Derive the conventional path to the nacre binary from the running
+ * executable's location.
+ *
+ * Convention (set by the orchestrator build script):
+ *
+ *   MyApp.app/
+ *     Contents/
+ *       MacOS/
+ *         myapp                ← process.execPath
+ *       Resources/
+ *         <appName>.app/
+ *           Contents/
+ *             MacOS/
+ *               nacre          ← always this relative path
+ *
+ * @param {string} appName  Value of taskPrimer.appName in package.json.
+ * @returns {string}        Absolute path to the nacre binary.
+ */
+function resolveNacreBinaryPath(appName) {
+  return path.resolve(
+    path.dirname(process.execPath),
+    `../Resources/${appName}.app/Contents/MacOS/nacre`
+  );
+}
+
+/**
+ * Derive the nacre Unix domain socket path from the app's bundle identifier.
+ *
+ * Must match the formula used by nacre's SocketPathHelper.defaultPath():
+ *   /tmp/<bundleId>/menu.sock
+ *
+ * @param {string} bundleId  Value of taskPrimer.appBundleId in package.json.
+ * @returns {string}
+ */
+function nacreSocketPath(bundleId) {
+  return `/tmp/${bundleId}/menu.sock`;
+}
+
+// ─── External dependencies (loaded below pure helpers) ────────────────────────
+
 const path                = require('path');
 const fs                  = require('fs');
 const http                = require('http');
 const { spawn, execSync } = require('child_process');
-const WebSocket           = require('ws');
-const {
-  install,
-  resolveBuildId,
-  detectBrowserPlatform,
-  computeExecutablePath,
-} = require('@puppeteer/browsers');
+const { EventEmitter }    = require('events');
+const net                 = require('net');
+
+// ws and @puppeteer/browsers are lazy-required inside the functions that use
+// them so that the pure helper functions (buildGuardScript, resolveNacreBinaryPath,
+// nacreSocketPath) can be imported and tested without node_modules installed.
+function requireWS()          { return require('ws'); }
+function requirePuppeteer()   { return require('@puppeteer/browsers'); }
 
 // ─── Launch flags ─────────────────────────────────────────────────────────────
 
@@ -181,7 +357,8 @@ function findAnyCachedBuild(cacheDir, platform) {
   });
 
   const buildId     = entries[0].slice(platform.length + 1); // strip "<platform>-"
-  const execPath    = computeExecutablePath({ cacheDir, browser: 'chrome', buildId });
+  const { computeExecutablePath: _cep } = requirePuppeteer();
+  const execPath    = _cep({ cacheDir, browser: 'chrome', buildId });
 
   return fs.existsSync(execPath) ? execPath : null;
 }
@@ -204,6 +381,7 @@ function findAnyCachedBuild(cacheDir, platform) {
  * @returns {Promise<string>}   Absolute path to the browser executable.
  */
 async function ensureChromium(cacheDir, buildId, autoUpdate) {
+  const { install, resolveBuildId, detectBrowserPlatform, computeExecutablePath } = requirePuppeteer();
   const platform = detectBrowserPlatform();
 
   if (!platform) {
@@ -317,311 +495,123 @@ function renameAppBundle(executablePath, appName) {
 }
 
 
-// ─── Navigation guard script ──────────────────────────────────────────────────
+// ─── CDP attach (CfT path only) ───────────────────────────────────────────────
 
 /**
- * Returns a script string to inject via Page.addScriptToEvaluateOnNewDocument.
+ * Poll the CDP /json/version HTTP endpoint until Chrome is ready to accept
+ * WebSocket connections.
  *
- * The script runs before any page code and enforces three categories of
- * restriction, each independently configurable:
- *
- *   Navigation guard (always on):
- *     Prevents the window from navigating away from the served origin.
- *     Covers: location.href/assign/replace, <a> clicks, <form> submits,
- *     and drag-and-drop of foreign URLs.
- *     Same-origin navigation is always allowed.
- *
- *   allowRefresh (default: true):
- *     When false, intercepts Cmd/Ctrl+R and F5 keydown events in the capture
- *     phase so the user cannot manually reload the page.
- *     Note: this does not prevent programmatic location.reload() calls,
- *     which downstream developers may need for legitimate purposes.
- *
- * Config values are baked into the script string at generation time so the
- * injected code has no runtime dependency on any external state.
- *
- * @param {object} opts
- * @param {boolean} opts.allowRefresh     default true
- * @returns {string}
+ * @param {number} port        CDP debug port.
+ * @param {number} maxWaitMs   Timeout in milliseconds (default 10 s).
+ * @returns {Promise<string>}  The browser-level WebSocket debugger URL.
  */
-function buildGuardScript({ allowRefresh = true } = {}) {
-  return `
-(function () {
-  'use strict';
-
-  const ALLOWED_ORIGIN     = window.location.origin;
-  const ALLOW_REFRESH      = ${allowRefresh};
-
-  function isForeignUrl(url) {
-    if (!url) return false;
-    try {
-      const parsed = new URL(url, window.location.href);
-      return parsed.origin !== ALLOWED_ORIGIN;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function block(reason, url) {
-    console.warn('[task-primer] Blocked (' + reason + '):', url);
-    return false;
-  }
-
-  // ── window.location overrides (navigation guard) ────────────────────────────
-  const nativeLocation = window.location;
-  const locationProxy  = new Proxy(nativeLocation, {
-    set(target, prop, value) {
-      if (prop === 'href' && isForeignUrl(value)) {
-        return block('location.href', value);
-      }
-      target[prop] = value;
-      return true;
-    },
-    get(target, prop) {
-      if (prop === 'assign') {
-        return function (url) {
-          if (isForeignUrl(url)) { block('location.assign', url); return; }
-          target.assign(url);
-        };
-      }
-      if (prop === 'replace') {
-        return function (url) {
-          if (isForeignUrl(url)) { block('location.replace', url); return; }
-          target.replace(url);
-        };
-      }
-      const val = target[prop];
-      return typeof val === 'function' ? val.bind(target) : val;
-    },
-  });
-
-  try {
-    Object.defineProperty(window, 'location', { get: () => locationProxy, configurable: false });
-  } catch (_) {}
-
-  // ── <a> click interception ──────────────────────────────────────────────────
-  document.addEventListener('click', function (e) {
-    const anchor = e.target.closest('a[href]');
-    if (!anchor) return;
-    if (isForeignUrl(anchor.href)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      block('anchor click', anchor.href);
-    }
-  }, true);
-
-  // ── <form> submit interception ──────────────────────────────────────────────
-  document.addEventListener('submit', function (e) {
-    const action = e.target.action || window.location.href;
-    if (isForeignUrl(action)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      block('form submit', action);
-    }
-  }, true);
-
-  // ── Drag-and-drop interception ──────────────────────────────────────────────
-  document.addEventListener('dragover', function (e) {
-    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'none';
-    }
-  }, true);
-
-  document.addEventListener('drop', function (e) {
-    if (e.dataTransfer && e.dataTransfer.types.includes('text/uri-list')) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      block('drag-and-drop', e.dataTransfer.getData('text/uri-list'));
-    }
-  }, true);
-
-
-  // ── Refresh interception (allowRefresh) ─────────────────────────────────────
-  // Blocks Cmd/Ctrl+R and F5 in the capture phase so they cannot reload the
-  // page. Does not affect programmatic location.reload() calls.
-  if (!ALLOW_REFRESH) {
-    document.addEventListener('keydown', function (e) {
-      const isReload = e.key === 'F5' ||
-                       ((e.metaKey || e.ctrlKey) && e.key === 'r') ||
-                       ((e.metaKey || e.ctrlKey) && e.key === 'R');
-      if (isReload) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        block('keyboard reload', e.key);
-      }
-    }, true);
-  }
-
-})();
-`;
-}
-
-// ─── CDP client ───────────────────────────────────────────────────────────────
-
-/**
- * Poll the CDP /json/version endpoint until Chrome is ready.
- *
- * @param {number} port
- * @param {number} [retries=20]
- * @param {number} [delayMs=200]
- * @returns {Promise<string>} The browser-level WebSocket debugger URL.
- */
-function waitForCDP(port, retries = 20, delayMs = 200) {
+function waitForCDP(port, maxWaitMs = 10_000) {
   return new Promise((resolve, reject) => {
-    let attempts = 0;
+    const deadline = Date.now() + maxWaitMs;
 
-    const try_ = () => {
+    function attempt() {
       http.get(`http://127.0.0.1:${port}/json/version`, (res) => {
         let body = '';
-        res.on('data', chunk => { body += chunk; });
+        res.on('data', (chunk) => { body += chunk; });
         res.on('end', () => {
           try {
-            const info = JSON.parse(body);
-            if (info.webSocketDebuggerUrl) {
-              resolve(info.webSocketDebuggerUrl);
-            } else {
-              retry();
-            }
-          } catch (_) {
-            retry();
-          }
+            const { webSocketDebuggerUrl } = JSON.parse(body);
+            if (webSocketDebuggerUrl) return resolve(webSocketDebuggerUrl);
+          } catch (_) {}
+          retry();
         });
       }).on('error', retry);
-    };
+    }
 
-    const retry = () => {
-      attempts++;
-      if (attempts >= retries) {
-        reject(new Error(`CDP not ready after ${retries} attempts on port ${port}`));
-        return;
+    function retry() {
+      if (Date.now() >= deadline) {
+        return reject(new Error(`CDP not ready on port ${port} after ${maxWaitMs} ms`));
       }
-      setTimeout(try_, delayMs);
-    };
+      setTimeout(attempt, 200);
+    }
 
-    try_();
+    attempt();
   });
 }
 
 /**
- * Attach a CDP client to the browser and emit 'windowClosed' on childProc
- * when the app window's target is destroyed.
+ * Install the navigation guard into a specific CDP page target.
  *
- * Uses only the 'ws' package already present in the project — no cdp library.
- *
- * @param {import('child_process').ChildProcess} childProc
+ * @param {string} targetId
  * @param {number} debugPort
+ * @param {string} guardScript
+ */
+async function installGuard(targetId, debugPort, guardScript) {
+  const wsUrl = await new Promise((resolve, reject) => {
+    http.get(`http://127.0.0.1:${debugPort}/json`, (res) => {
+      let body = '';
+      res.on('data', (c) => { body += c; });
+      res.on('end', () => {
+        try {
+          const targets = JSON.parse(body);
+          const t = targets.find((t) => t.id === targetId);
+          if (t && t.webSocketDebuggerUrl) return resolve(t.webSocketDebuggerUrl);
+          reject(new Error('Target not found in /json'));
+        } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+
+  await new Promise((resolve, reject) => {
+    const WebSocket = requireWS();
+    const pageWs   = new WebSocket(wsUrl);
+    let   msgId    = 1;
+
+    pageWs.once('open', () => {
+      pageWs.send(JSON.stringify({
+        id:     msgId++,
+        method: 'Page.addScriptToEvaluateOnNewDocument',
+        params: { source: guardScript },
+      }));
+    });
+
+    pageWs.once('message', () => {
+      pageWs.close();
+      resolve();
+    });
+
+    pageWs.once('error', reject);
+  });
+}
+
+/**
+ * Attach a CDP client to the running Chrome instance.
+ * Manages target lifecycle and emits 'windowClosed' on childProc.
+ *
+ * @param {ChildProcess} childProc
+ * @param {number}       debugPort
+ * @param {string}       appUrl
+ * @param {object}       guardOpts       { allowRefresh }
+ * @param {object}       lifeCycleOpts   { devTools }
  */
 async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts) {
-  let wsUrl;
-  try {
-    wsUrl = await waitForCDP(debugPort);
-  } catch (err) {
-    console.warn(`[browser] CDP attach failed (non-fatal): ${err.message}`);
-    console.warn('[browser] Window-close detection will fall back to process exit.');
-    return;
-  }
-
-  // ── Browser-level WebSocket (target management + lifecycle events) ───────────
-
-  const browserWs         = new WebSocket(wsUrl);
+  const browserWsUrl      = await waitForCDP(debugPort);
+  const WebSocket         = requireWS();
+  const browserWs         = new WebSocket(browserWsUrl);
   let   browserMsgId      = 1;
   const browserPendingCmds = new Map();
 
-  // Promised CDP command on the browser endpoint
-  function browserSend(method, params) {
+  const guardScript = buildGuardScript(guardOpts);
+
+  function browserSend(method, params = {}) {
     return new Promise((resolve) => {
       const id = browserMsgId++;
       browserPendingCmds.set(id, resolve);
-      browserWs.send(JSON.stringify({ id, method, params: params || {} }));
+      browserWs.send(JSON.stringify({ id, method, params }));
     });
   }
 
-  // ── Per-page CDP connection ───────────────────────────────────────────────
-  //
-  // Rather than multiplexing page-level commands through the browser session
-  // (which requires careful sessionId / id namespace management), we connect
-  // a dedicated WebSocket directly to each page target's own debugger URL.
-  // Chrome exposes these at GET http://127.0.0.1:<port>/json/list.
-  // This gives a clean, isolated channel where every command is properly
-  // sequenced and responses are unambiguous.
-
-  function getPageTargetWsUrl(debugPort, targetId) {
-    return new Promise((resolve, reject) => {
-      http.get(`http://127.0.0.1:${debugPort}/json/list`, (res) => {
-        let body = '';
-        res.on('data', c => { body += c; });
-        res.on('end', () => {
-          try {
-            const targets = JSON.parse(body);
-            const target  = targets.find(t => t.id === targetId);
-            if (target && target.webSocketDebuggerUrl) {
-              resolve(target.webSocketDebuggerUrl);
-            } else {
-              reject(new Error(`No WS URL for target ${targetId}`));
-            }
-          } catch (e) { reject(e); }
-        });
-      }).on('error', reject);
-    });
-  }
-
-  // Attach a dedicated WebSocket to a page target, inject the guard, reload.
-  const guardedTargets = new Set();
-
-  async function installGuard(targetId) {
-    if (guardedTargets.has(targetId)) return;
-    guardedTargets.add(targetId);
-
-    console.log('[browser] CDP: connecting to page target', targetId);
-
-    let pageWsUrl;
+  async function installGuardForTarget(targetId) {
     try {
-      pageWsUrl = await getPageTargetWsUrl(debugPort, targetId);
+      await installGuard(targetId, debugPort, guardScript);
     } catch (err) {
-      console.warn(`[browser] CDP: could not get page WS URL (non-fatal): ${err.message}`);
-      return;
+      console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
     }
-
-    const pageWs         = new WebSocket(pageWsUrl);
-    let   pageMsgId      = 1;
-    const pagePendingCmds = new Map();
-
-    function pageSend(method, params) {
-      return new Promise((resolve) => {
-        const id = pageMsgId++;
-        pagePendingCmds.set(id, resolve);
-        pageWs.send(JSON.stringify({ id, method, params: params || {} }));
-      });
-    }
-
-    pageWs.on('message', (data) => {
-      let msg;
-      try { msg = JSON.parse(data); } catch (_) { return; }
-      if (msg.id !== undefined && pagePendingCmds.has(msg.id)) {
-        const resolve = pagePendingCmds.get(msg.id);
-        pagePendingCmds.delete(msg.id);
-        resolve(msg.result || {});
-      }
-    });
-
-    await new Promise((resolve, reject) => {
-      pageWs.on('open', resolve);
-      pageWs.on('error', reject);
-    });
-
-    // Sequence matters: enable Page domain first, then register the script,
-    // then reload — each step awaited so ordering is guaranteed.
-    await pageSend('Page.enable', {});
-    await pageSend('Page.addScriptToEvaluateOnNewDocument', {
-      source: buildGuardScript(guardOpts),
-    });
-    await pageSend('Page.reload', { ignoreCache: false });
-
-    console.log('[browser] CDP: navigation guard injected, page reloading');
-
-    // Page WS can be closed after setup — the guard persists in the target
-    pageWs.close();
   }
 
   // ── Browser-level message dispatch ────────────────────────────────────────
@@ -712,9 +702,7 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
 
       // Allowed page target — install navigation guard
       if (type === 'page') {
-        installGuard(targetId).catch(err => {
-          console.warn('[browser] CDP: installGuard error (non-fatal):', err.message);
-        });
+        installGuardForTarget(targetId);
       }
       return;
     }
@@ -754,6 +742,178 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
       childProc.emit('windowClosed');
     }
   });
+}
+
+// ─── nacre path ───────────────────────────────────────────────────────────────
+
+/**
+ * Connect to nacre's Unix domain socket, retrying until the socket file
+ * appears (nacre may take a moment to start up).
+ *
+ * @param {string} socketPath
+ * @param {number} maxWaitMs   Timeout in milliseconds (default 10 s).
+ * @returns {Promise<net.Socket>}
+ */
+function connectToNacre(socketPath, maxWaitMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + maxWaitMs;
+
+    function attempt() {
+      const sock = net.createConnection(socketPath);
+
+      sock.once('connect', () => resolve(sock));
+
+      sock.once('error', (err) => {
+        sock.destroy();
+        if (Date.now() >= deadline) {
+          return reject(new Error(
+            `Could not connect to nacre socket at "${socketPath}" ` +
+            `after ${maxWaitMs} ms: ${err.message}`
+          ));
+        }
+        setTimeout(attempt, 200);
+      });
+    }
+
+    attempt();
+  });
+}
+
+/**
+ * Spawn the nacre binary and wire up the socket protocol.
+ *
+ * Returns a fake EventEmitter that is API-compatible with the ChildProcess
+ * returned by the CfT launch() function.  main.js uses only:
+ *   .on('windowClosed', fn)
+ *   .on('exit', fn)
+ *   .pid
+ *   .killed  (checked in shutdown())
+ *   .kill()  (called in shutdown())
+ *
+ * @param {object}      options
+ * @param {string}      options.url            URL to load in WKWebView.
+ * @param {string}      options.appName        taskPrimer.appName — used to resolve nacre path.
+ * @param {string}      options.appBundleId    taskPrimer.appBundleId — used for socket path.
+ * @param {number|null} options.windowWidth    Initial window width.
+ * @param {number|null} options.windowHeight   Initial window height.
+ * @param {number|null} options.windowX        Initial window X.
+ * @param {number|null} options.windowY        Initial window Y.
+ * @param {boolean}     options.devTools       Whether to enable Web Inspector (default false).
+ * @param {boolean}     options.allowRefresh   Whether to allow Cmd+R reload (default true).
+ * @returns {Promise<EventEmitter>}  Fake browser handle.
+ */
+async function launchNacre({
+  url,
+  appName,
+  appBundleId,
+  windowWidth  = null,
+  windowHeight = null,
+  windowX      = null,
+  windowY      = null,
+  devTools     = false,
+  allowRefresh = true,
+}) {
+  const nacreBin    = resolveNacreBinaryPath(appName);
+  const sockPath    = nacreSocketPath(appBundleId);
+
+  // Build argv to pass to nacre — all standard CfT flags nacre already
+  // understands, plus --nacre-socket so it knows where to listen.
+  const nacreArgs = [
+    `--app=${url}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--disable-translate',
+    '--disable-infobars',
+    `--nacre-socket=${sockPath}`,
+  ];
+
+  if (windowWidth != null && windowHeight != null) {
+    nacreArgs.push(`--window-size=${Math.round(windowWidth)},${Math.round(windowHeight)}`);
+  }
+  if (windowX != null && windowY != null) {
+    nacreArgs.push(`--window-position=${Math.round(windowX)},${Math.round(windowY)}`);
+  }
+
+  console.log(`[browser] Launching nacre → ${url}`);
+
+  const child = spawn(nacreBin, nacreArgs, {
+    detached: false,
+    stdio:    'ignore',
+  });
+
+  child.on('error', (err) => {
+    console.error(`[browser] Failed to spawn nacre: ${err.message}`);
+  });
+
+  // Create the fake handle that main.js will use.
+  // We proxy .pid, .killed, and .kill() from the real child process.
+  const handle = new EventEmitter();
+  Object.defineProperty(handle, 'pid',    { get: () => child.pid });
+  Object.defineProperty(handle, 'killed', { get: () => child.killed });
+  handle.kill = (signal) => child.kill(signal);
+
+  // Forward the real process exit event
+  child.on('exit', (code, signal) => {
+    handle.emit('exit', code, signal);
+  });
+
+  // Connect to the nacre socket and set up the protocol
+  let sock;
+  try {
+    sock = await connectToNacre(sockPath);
+    console.log(`[browser] Connected to nacre socket at ${sockPath}`);
+  } catch (err) {
+    console.warn(`[browser] nacre socket connection failed: ${err.message}`);
+    return handle;
+  }
+
+  // Newline-delimited JSON framing — same protocol as nacre's SocketServer
+  function sendToNacre(message) {
+    try {
+      sock.write(JSON.stringify(message) + '\n');
+    } catch (err) {
+      console.warn(`[browser] nacre socket write error: ${err.message}`);
+    }
+  }
+
+  // Send initial configuration messages
+  sendToNacre({ type: 'set_url',      url });
+  sendToNacre({ type: 'set_devtools', enabled: devTools });
+  sendToNacre({ type: 'set_script',   script: buildGuardScript({ allowRefresh }) });
+
+  // Handle inbound messages from nacre
+  let buffer = '';
+  sock.on('data', (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep incomplete trailing line
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let msg;
+      try { msg = JSON.parse(trimmed); } catch (_) { continue; }
+
+      if (msg.type === 'window_closed') {
+        console.log('[browser] nacre: window closed');
+        handle.emit('windowClosed');
+      }
+      // menu_action, file_open, app_reopen — available for future use
+    }
+  });
+
+  sock.on('error', (err) => {
+    console.warn(`[browser] nacre socket error: ${err.message}`);
+  });
+
+  sock.on('close', () => {
+    console.log('[browser] nacre socket closed');
+    // If the socket closes unexpectedly, treat it as a window close
+    handle.emit('windowClosed');
+  });
+
+  return handle;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -827,4 +987,4 @@ async function launch({
   return child;
 }
 
-module.exports = { launch };
+module.exports = { launch, launchNacre, buildGuardScript, resolveNacreBinaryPath, nacreSocketPath };
