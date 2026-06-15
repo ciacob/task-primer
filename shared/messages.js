@@ -53,6 +53,15 @@ const NOTIFY = {
   APP_REOPEN:  'NOTIFY_APP_REOPEN',   // payload: (none)
 };
 
+// ─── Internal bootstrap messages ───────────────────────────────────────────────
+// One-time configuration messages that do not fit the CMD/EVT/NOTIFY groups.
+const INTERNAL = {
+  // main → worker: informs the worker whether the app is running in nacre mode.
+  // Sent once immediately after EVT.READY so context.ui.isNacre is accurate
+  // before the first task is assigned.
+  SET_IS_NACRE: 'INTERNAL_SET_IS_NACRE',
+};
+
 // ─── Internal: server-process ↔ main ─────────────────────────────────────────
 const SRV = {
   // server → main  (forwarded REST commands)
@@ -85,4 +94,4 @@ function msg(type, payload, id) {
   return envelope;
 }
 
-module.exports = { CMD, EVT, UI_CMD, NOTIFY, SRV, STATE, msg };
+module.exports = { CMD, EVT, UI_CMD, NOTIFY, INTERNAL, SRV, STATE, msg };

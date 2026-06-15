@@ -7,29 +7,28 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "start":      "node main.js",
-    "start:ui":   "node main.js --ui",
-    "start:dev":  "node main.js --ui --worker-crash=restart --autoexit"
+    "start": "node main.js",
+    "start:ui": "node main.js --ui",
+    "start:dev": "node main.js --ui --worker-crash=restart --autoexit",
+    "test": "node --test shared/messages.test.js browser/launcher.nacre.test.js browser/launcher.args.test.js browser/nacre-ui.test.js worker/task-shell.test.js worker/task-shell.ui.test.js pickPorts.test.js server/routes.test.js"
   },
   "taskPrimer": {
     "appName": "Task Primer",
-    "webPort":  6321,
-    "webHost":  "127.0.0.1",
-
+    "webPort": 6321,
+    "webHost": "127.0.0.1",
     "window": {
-      "width":  null,
+      "width": null,
       "height": null,
-      "x":      null,
-      "y":      null
+      "x": null,
+      "y": null
     },
-
     "security": {
-      "devTools":       true,
-      "allowRefresh":    true
+      "devTools": true,
+      "allowRefresh": true
     },
     "browser": {
-      "product":  "chrome",
-      "buildId":  "stable",
+      "product": "chrome",
+      "buildId": "stable",
       "cacheDir": ".browsers",
       "debugPort": 8120,
       "notes": [
@@ -43,15 +42,21 @@
       ]
     }
   },
-  "keywords": ["worker", "subprocess", "ipc", "fastify", "task-queue"],
+  "keywords": [
+    "worker",
+    "subprocess",
+    "ipc",
+    "fastify",
+    "task-queue"
+  ],
   "license": "ISC",
   "dependencies": {
-    "@fastify/static":    "^9.0.0",
+    "@fastify/static": "^9.0.0",
     "@fastify/websocket": "^11.2.0",
     "@puppeteer/browsers": "^2.0.0",
-    "fastify":            "^5.8.4",
-    "fastify-plugin":     "^5.1.0",
-    "ws":                 "^8.20.0",
-    "yargs":              "17.7.2"
+    "fastify": "^5.8.4",
+    "fastify-plugin": "^5.1.0",
+    "ws": "^8.20.0",
+    "yargs": "17.7.2"
   }
 }

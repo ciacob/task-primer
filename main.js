@@ -33,7 +33,7 @@ const path        = require('path');
 const yargs       = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 
-const { CMD, EVT, SRV, UI_CMD, STATE, msg } = require('./shared/messages');
+const { CMD, EVT, SRV, UI_CMD, INTERNAL, STATE, msg } = require('./shared/messages');
 
 // ─── CLI arguments ────────────────────────────────────────────────────────────
 
@@ -119,10 +119,9 @@ function spawnWorker() {
         // is accurate before the first task is assigned. nacreUI is set during
         // launchBrowser(); if --ui was not passed it stays null (not nacre).
         if (workerProc && workerProc.connected) {
-          workerProc.send({
-            type:    'WORKER_SET_IS_NACRE',
-            payload: { isNacre: nacreUI ? nacreUI.isNacre : false },
-          });
+          workerProc.send(
+            msg(INTERNAL.SET_IS_NACRE, { isNacre: nacreUI ? nacreUI.isNacre : false })
+          );
         }
         break;
 

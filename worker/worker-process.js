@@ -17,7 +17,7 @@
 
 const path      = require('path');
 const TaskShell = require('./task-shell');
-const { CMD, EVT, UI_CMD, NOTIFY, msg } = require('../shared/messages');
+const { CMD, EVT, UI_CMD, NOTIFY, INTERNAL, msg } = require('../shared/messages');
 
 // ─── UI delegate ─────────────────────────────────────────────────────────────
 // Injected into TaskShell so context.ui.setMenu() etc. can forward messages
@@ -96,7 +96,7 @@ process.on('message', (envelope) => {
     // main.js sends this once after launching nacre so context.ui.isNacre
     // is correct before the first task is assigned.
 
-    case 'WORKER_SET_IS_NACRE':
+    case INTERNAL.SET_IS_NACRE:
       uiDelegate.isNacre = Boolean(envelope.payload?.isNacre);
       break;
 

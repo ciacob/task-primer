@@ -495,6 +495,44 @@ function renameAppBundle(executablePath, appName) {
 }
 
 
+// ─── shouldCloseTarget (pure helper, also used by attachCDP) ────────────────
+
+/**
+ * Decide whether a CDP target should be closed immediately after it is created.
+ *
+ * Extracted as a pure top-level function so it can be unit-tested independently
+ * of the CDP connection lifecycle.
+ *
+ * @param {string}  type        CDP target type ('page', 'other', …)
+ * @param {string}  url         Target URL at creation time.
+ * @param {string}  appOrigin   The served app origin (e.g. 'http://127.0.0.1:3000').
+ * @param {boolean} devTools    Whether DevTools windows should be allowed.
+ * @returns {string|null}  Reason string to close, or null to keep.
+ */
+function shouldCloseTarget(type, url, appOrigin, devTools) {
+  // DevTools targets
+  if (url && url.startsWith('devtools://')) {
+    return devTools ? null : 'DevTools suppressed (security.devTools: false)';
+  }
+
+  // Non-page targets (service workers, shared workers, etc.) — never close
+  if (type !== 'page') return null;
+
+  // Blank or unparseable URL — transient about:blank before navigation.
+  // Close it; legitimate same-origin popups arrive with their actual URL set.
+  let targetOrigin;
+  try {
+    const parsed = new URL(url);
+    targetOrigin = (parsed.origin === 'null' || !parsed.origin) ? null : parsed.origin;
+  } catch (_) {
+    targetOrigin = null;
+  }
+
+  if (!targetOrigin) return 'blank or unparseable URL';
+  if (targetOrigin === appOrigin) return null;  // same-origin — allowed
+  return 'foreign origin (' + targetOrigin + ')';
+}
+
 // ─── CDP attach (CfT path only) ───────────────────────────────────────────────
 
 /**
@@ -626,39 +664,9 @@ async function attachCDP(childProc, debugPort, appUrl, guardOpts, lifeCycleOpts)
   const appOrigin = new URL(appUrl).origin;
 
   // Decide whether a newly created target should be kept or closed immediately.
-  // Returns a string reason if it should be closed, null if it should be kept.
+  // Delegated to the exported pure function; closured vars are passed explicitly.
   function shouldClose(type, url) {
-    // DevTools targets — close when devTools is false
-    if (url && url.startsWith('devtools://')) {
-      return devTools ? null : 'DevTools suppressed (security.devTools: false)';
-    }
-
-    // Non-page targets (service workers, shared workers, etc.) — never close
-    if (type !== 'page') return null;
-
-    // Unparseable or blank URL — could be a transient about:blank before
-    // navigation. Close it; legitimate same-origin popups will have the
-    // actual URL set at targetCreated time.
-    let targetOrigin;
-    try {
-      const parsed = new URL(url);
-      // about:blank has origin 'null' as a string — treat as foreign
-      targetOrigin = (parsed.origin === 'null' || !parsed.origin) ? null : parsed.origin;
-    } catch (_) {
-      targetOrigin = null;
-    }
-
-    if (!targetOrigin) {
-      return 'blank or unparseable URL';
-    }
-
-    if (targetOrigin === appOrigin) {
-      // Same-origin page target
-      return null; // Allowed
-    }
-
-    // Foreign-origin page target — always close
-    return 'foreign origin (' + targetOrigin + ')';
+    return shouldCloseTarget(type, url, appOrigin, devTools);
   }
 
   browserWs.on('message', (data) => {
@@ -998,4 +1006,4 @@ async function launch({
   return child;
 }
 
-module.exports = { launch, launchNacre, buildGuardScript, resolveNacreBinaryPath, nacreSocketPath };
+module.exports = { launch, launchNacre, buildGuardScript, buildLaunchArgs, shouldCloseTarget, resolveNacreBinaryPath, nacreSocketPath };
