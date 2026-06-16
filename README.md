@@ -147,7 +147,7 @@ All runtime configuration lives under `taskPrimer` in `package.json`. No config 
 }
 ```
 
-**`appName`** — window title and `<h1>` heading. In Chrome for Testing mode, also patches the `.app` bundle's `Info.plist` so the menu bar shows the correct name. In nacre mode this is set at bundle-assembly time; see the nacre documentation.
+**`appName`** — sets the browser window `<title>` and the `<h1>` heading in the UI (served via `GET /config`). In nacre mode it is also used to locate the nacre binary; see the nacre documentation.
 
 **`appBundleId`** — the macOS bundle identifier for the packaged application (e.g. `"com.example.myapp"`). Required in nacre mode (the orchestrator writes this); unused in Chrome for Testing mode.
 

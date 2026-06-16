@@ -54,19 +54,6 @@
  *   The CDP client is intentionally minimal — no library dependency, just the
  *   'ws' package already present in the project.
  *
- * ── macOS app rename ─────────────────────────────────────────────────────────
- *
- *   Patches CFBundleName and CFBundleDisplayName in the .app bundle's
- *   Info.plist using macOS's built-in plutil tool, then re-registers the
- *   bundle with Launch Services (lsregister) to flush the Dock's name cache.
- *   Both tools are macOS system utilities — no extra dependency.
- *
- *   A sentinel file (<bundle>/Contents/.last-rename) records the last name
- *   written. The patch is skipped if the sentinel matches the desired name.
- *
- *   Note: menu bar *entries* (File, Edit, View, …) are Chrome internals and
- *   cannot be customised. Only the bold app name at the far left is affected.
- *
  * ── Build resolution ─────────────────────────────────────────────────────────
  *
  *   buildId 'stable' is resolved at download time to the current cross-platform
@@ -243,7 +230,7 @@ function nacreSocketPath(bundleId) {
 const path                = require('path');
 const fs                  = require('fs');
 const http                = require('http');
-const { spawn, execSync } = require('child_process');
+const { spawn }           = require('child_process');
 const { EventEmitter }    = require('events');
 const net                 = require('net');
 
@@ -438,62 +425,6 @@ async function ensureChromium(cacheDir, buildId, autoUpdate) {
   process.stdout.write('\r[browser] Download complete.              \n');
   return executablePath;
 }
-
-// ─── macOS app bundle rename ──────────────────────────────────────────────────
-
-/**
- * Patch Info.plist and flush the Launch Services cache so the Dock, menu bar,
- * and Mission Control all reflect appName instead of "Google Chrome for Testing".
- *
- * No-ops silently on non-macOS. Warns but does not throw on failure.
- *
- * @param {string} executablePath  Absolute path to the browser binary.
- * @param {string} appName         Desired application name.
- */
-function renameAppBundle(executablePath, appName) {
-  if (process.platform !== 'darwin') return;
-  if (!appName)                       return;
-
-  // Binary is at <bundle>/Contents/MacOS/<name>
-  // Two levels up lands in Contents/, where Info.plist lives.
-  const bundleContents = path.resolve(executablePath, '..', '..');
-  const bundlePath     = path.resolve(bundleContents, '..');   // the .app itself
-  const plistPath      = path.join(bundleContents, 'Info.plist');
-  const sentinelPath   = path.join(bundleContents, '.last-rename');
-
-  if (!fs.existsSync(plistPath)) {
-    console.warn('[browser] Info.plist not found — skipping app rename.');
-    return;
-  }
-
-  // Skip if already patched with this exact name
-  try {
-    const last = fs.readFileSync(sentinelPath, 'utf8').trim();
-    if (last === appName) return;
-  } catch (_) {}
-
-  try {
-    const q = JSON.stringify(appName);
-    execSync(`plutil -replace CFBundleName        -string ${q} "${plistPath}"`);
-    execSync(`plutil -replace CFBundleDisplayName -string ${q} "${plistPath}"`);
-
-    // Flush the Launch Services database so the Dock picks up the new name.
-    // lsregister is a macOS system tool — always present, no dependency.
-    const lsregister =
-      '/System/Library/Frameworks/CoreServices.framework' +
-      '/Versions/A/Frameworks/LaunchServices.framework' +
-      '/Versions/A/Support/lsregister';
-
-    execSync(`"${lsregister}" -f "${bundlePath}"`);
-
-    fs.writeFileSync(sentinelPath, appName, 'utf8');
-
-    console.log(`[browser] App bundle renamed to "${appName}" (Dock cache flushed).`);
-  } catch (err) {
-    console.warn(`[browser] App rename failed (non-fatal): ${err.message}`);
-  }
-}
-
 
 // ─── shouldCloseTarget (pure helper, also used by attachCDP) ────────────────
 
@@ -946,7 +877,6 @@ async function launchNacre({
  * @param {string}  options.cacheDir        Absolute path to the browser cache dir.
  * @param {string}  options.buildId         Channel name or exact version (default: 'stable').
  * @param {boolean} [options.autoUpdate]    Re-download if a newer stable is available (default: false).
- * @param {string}  [options.appName]       Desired macOS app name. Null to skip.
  * @param {number}  [options.debugPort]     CDP remote debugging port (default: 9222).
  * @param {number|null} [options.windowWidth]   Initial window width in CSS pixels.
  * @param {number|null} [options.windowHeight]  Initial window height in CSS pixels.
@@ -965,7 +895,6 @@ async function launch({
   cacheDir,
   buildId         = 'stable',
   autoUpdate      = false,
-  appName         = null,
   debugPort       = 9222,
   windowWidth     = null,
   windowHeight    = null,
@@ -976,7 +905,6 @@ async function launch({
 }) {
   const executablePath = await ensureChromium(cacheDir, buildId, autoUpdate);
 
-  renameAppBundle(executablePath, appName);
 
   console.log(`[browser] Launching Chrome for Testing → ${url}`);
 

@@ -325,12 +325,11 @@ async function launchBrowser() {
     const cacheDir  = path.resolve(__dirname, browserCfg.cacheDir || '.browsers');
     const buildId   = browserCfg.buildId   || 'stable';
     const autoUpdate = browserCfg.autoUpdate === true;
-    const appName   = taskPrimerCfg.appName || null;
     const debugPort = browserCfg.debugPort != null ? browserCfg.debugPort : 9222;
 
     try {
       browserProc = await launch({
-        url: SERVER_URL, cacheDir, buildId, autoUpdate, appName, debugPort,
+        url: SERVER_URL, cacheDir, buildId, autoUpdate, debugPort,
         windowWidth, windowHeight, windowX, windowY,
         devTools, allowRefresh,
       });
