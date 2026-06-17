@@ -295,3 +295,9 @@ const cacheDir = path.resolve(path.dirname(process.execPath), '.browsers');
 In nacre mode there is no browser binary to manage — WebKit is provided by the OS.
 
 **Static UI assets** — declare `ui/` as a `pkg` asset directory so `@fastify/static` can find the files at runtime.
+
+---
+
+## Licensing and commercial use
+
+task-primer, like any open-source Node.js bundling target (`pkg`, Electron, NW.js, and similar), provides no binary-level license enforcement — bundled code is extractable from the packaged binary by design. If your product needs enforced licensing, that logic belongs in a server your app depends on, not in the bundled binary. See [nacre's README](https://github.com/ciacob/nacre#licensing-and-commercial-use) for a fuller discussion when using the nacre UI mode.
